@@ -629,13 +629,22 @@ pub struct SourceInfo {
     pub spans: HashMap<Fingerprint, FlatSourceLocation>,
 }
 
+impl SourceInfo {
+    pub fn empty() -> Self {
+        Self {
+            files: Vec::new(),
+            spans: HashMap::new(),
+        }
+    }
+}
+
 pub struct SourceInfoCollector {}
 
 impl SourceInfoCollector {
     pub fn finallize(self) -> SourceInfo {
-        todo!()
+        SourceInfo::empty()
     }
     pub fn intern(_i: &Node) {
-        todo!()
+        // no-op for now
     }
 }

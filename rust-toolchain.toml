@@ -2,3 +2,4 @@
 channel = "1.88"
 profile = "minimal"
 components = ["rust-src"]
+targets = ["wasm32-unknown-unknown"]

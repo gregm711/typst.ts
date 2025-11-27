@@ -129,6 +129,7 @@ pub trait RenderVm<'m>: Sized + FontIndice<'m> {
             ir::VecItem::Labelled(labelled) => self.render_labelled_item(abs_ref, labelled),
             ir::VecItem::Text(text) => {
                 let mut g = self.start_text(abs_ref, text);
+                g = g.with_text(self, text, abs_ref);
                 g = self.render_text(g, abs_ref, text);
 
                 g.into()
@@ -180,9 +181,9 @@ pub trait RenderVm<'m>: Sized + FontIndice<'m> {
 
     /// Render a frame group into underlying context.
     fn render_group(&mut self, abs_ref: &Fingerprint, group: &ir::GroupRef) -> Self::Resultant {
-        let mut group_ctx = self.start_frame(abs_ref, group);
+        let mut group_ctx = self.start_frame(abs_ref, group).with_frame(self, group);
 
-        for (pos, item_ref) in group.0.iter() {
+        for (pos, item_ref) in group.items.iter() {
             // let item = self.get_item(&item_ref).unwrap();
             group_ctx.render_item_at(self, *pos, item_ref);
         }
@@ -337,12 +338,16 @@ where
         next: &ir::GroupRef,
     ) {
         if let Some(ir::VecItem::Group(prev_group)) = prev_item_ {
-            let mut unused_prev: BTreeMap<usize, Fingerprint> =
-                prev_group.0.iter().map(|v| v.1).enumerate().collect();
+            let mut unused_prev: BTreeMap<usize, Fingerprint> = prev_group
+                .items
+                .iter()
+                .map(|v| v.1)
+                .enumerate()
+                .collect();
             let reusable: HashSet<Fingerprint, RandomState> =
-                HashSet::from_iter(prev_group.0.iter().map(|e| e.1));
+                HashSet::from_iter(prev_group.items.iter().map(|e| e.1));
 
-            for (_, item_ref) in next.0.iter() {
+            for (_, item_ref) in next.items.iter() {
                 if reusable.contains(item_ref) {
                     let remove_key = unused_prev.iter().find(|(_, v)| *v == item_ref);
                     if remove_key.is_none() {
@@ -352,7 +357,7 @@ where
                 }
             }
 
-            for (pos, item_ref) in next.0.iter() {
+            for (pos, item_ref) in next.items.iter() {
                 if reusable.contains(item_ref) {
                     group_ctx.render_diff_item_at(self, *pos, item_ref, item_ref);
                 } else if let Some((_, prev_item_re_)) = &unused_prev.pop_first() {
@@ -362,7 +367,7 @@ where
                 }
             }
         } else {
-            for (pos, item_ref) in next.0.iter() {
+            for (pos, item_ref) in next.items.iter() {
                 group_ctx.render_item_at(self, *pos, item_ref);
             }
         }

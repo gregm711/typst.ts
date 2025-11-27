@@ -537,14 +537,25 @@ impl<
         )
     }
 
-    fn with_frame(mut self, _ctx: &mut C, _group: &ir::GroupRef) -> Self {
+    fn with_frame(mut self, _ctx: &mut C, group: &ir::GroupRef) -> Self {
         self.attributes.push(("class", "typst-group".to_owned()));
+        if let Some(span_id) = group.span_id {
+            if _ctx.should_attach_debug_info() {
+                self.attributes.push(("data-span", format!("{:x}", span_id)));
+            }
+        }
         self
     }
 
     fn with_text(mut self, ctx: &mut C, text: &ir::TextItem, fill_key: &Fingerprint) -> Self {
         let font = ctx.get_font(&text.shape.font).unwrap();
         let upem = font.units_per_em;
+
+        // Attach debug info if available
+        // Assuming text.content.span_id is the field, based on typical Typst IR
+        if let Some(span_id) = text.content.span_id {
+            self.attach_debug_info(ctx, span_id);
+        }
 
         self.with_text_shape(ctx, upem, &text.shape, fill_key);
         self

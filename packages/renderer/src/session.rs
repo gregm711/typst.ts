@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use reflexo_typst::error::prelude::*;
@@ -174,6 +175,10 @@ pub struct RenderSession {
 
     /// underlying communication client model
     pub(crate) client: Arc<Mutex<IncrDocClient>>,
+    /// file id -> path mapping extracted from layout metadata
+    pub(crate) file_map: std::sync::Mutex<HashMap<u32, String>>,
+    /// span id -> (file_id, start, end) mapping
+    pub(crate) span_map: std::sync::Mutex<HashMap<u64, (u32, usize, usize)>>,
     /// underlying incremental state of canvas rendering
     #[cfg(feature = "render_canvas")]
     pub(crate) canvas_kern: Arc<Mutex<IncrCanvasDocClient>>,
@@ -230,9 +235,88 @@ impl RenderSession {
         self.client().kern().source_span(path)
     }
 
+    pub fn source_loc_from_span(&self, span_hex: String) -> Option<String> {
+        let raw = u64::from_str_radix(&span_hex, 16).ok()?;
+
+        // Mirror typst::syntax::Span layout:
+        const NUMBER_BITS: u64 = 48;
+        const NUMBER_MASK: u64 = (1u64 << NUMBER_BITS) - 1;
+        const RANGE_BASE: u64 = 1u64 << 47;
+        const RANGE_PART_BITS: u64 = 23;
+        const RANGE_PART_SHIFT: u64 = RANGE_PART_BITS;
+        const RANGE_PART_MASK: u64 = (1u64 << RANGE_PART_BITS) - 1;
+
+        let file_id = raw >> NUMBER_BITS;
+        let number = raw & NUMBER_MASK;
+
+        let mut payload = String::new();
+        use std::fmt::Write as _;
+
+        // Encode a human-ish payload the worker can forward.
+        // Assume single-file main.typ unless we ship a file table.
+        let filepath = {
+            let map = self.file_map.lock().unwrap();
+            map.get(&(file_id as u32))
+                .cloned()
+                .unwrap_or_else(|| {
+                    if file_id == 0 {
+                        "/main.typ".to_string()
+                    } else {
+                        format!("file-{file_id}")
+                    }
+                })
+        };
+
+        if let Some((f_id, start, end)) = self.span_map.lock().unwrap().get(&raw) {
+            write!(
+                &mut payload,
+                "{{\"span\":\"{}\",\"fileId\":{},\"filepath\":\"{}\",\"start\":{},\"end\":{},\"is_range\":true}}",
+                span_hex, f_id, filepath, start, end
+            )
+            .ok()?;
+            return Some(payload);
+        }
+
+        if number < 2 {
+            // Detached span.
+            write!(
+                &mut payload,
+                "{{\"span\":\"{}\",\"detached\":true,\"fileId\":{},\"filepath\":\"{}\",\"number\":{}}}",
+                span_hex, file_id, filepath, number
+            )
+            .ok()?;
+            return Some(payload);
+        }
+
+        if number >= RANGE_BASE {
+            let range = number - RANGE_BASE;
+            let start = range >> RANGE_PART_SHIFT;
+            let end = range & RANGE_PART_MASK;
+            write!(
+                &mut payload,
+                "{{\"span\":\"{}\",\"fileId\":{},\"filepath\":\"{}\",\"start\":{},\"end\":{},\"is_range\":true}}",
+                span_hex, file_id, filepath, start, end
+            )
+            .ok()?;
+            return Some(payload);
+        }
+
+        // Numbered span (fallback to number only).
+        write!(
+            &mut payload,
+            "{{\"span\":\"{}\",\"fileId\":{},\"filepath\":\"{}\",\"number\":{}}}",
+            span_hex, file_id, filepath, number
+        )
+        .ok()?;
+
+        Some(payload)
+    }
+
     pub(crate) fn reset(&mut self) {
         let mut client = self.client.lock().unwrap();
         *client = IncrDocClient::default();
+        self.file_map.lock().unwrap().clear();
+        self.span_map.lock().unwrap().clear();
         if cfg!(feature = "render_canvas") {
             let mut canvas_kern = self.canvas_kern.lock().unwrap();
             canvas_kern.reset();
@@ -246,6 +330,8 @@ impl RenderSession {
     pub(crate) fn reset_current(&mut self, delta: &[u8]) -> Result<()> {
         let mut client = self.client.lock().unwrap();
         *client = IncrDocClient::default();
+        self.file_map.lock().unwrap().clear();
+        self.span_map.lock().unwrap().clear();
         if cfg!(feature = "render_canvas") {
             let mut canvas_kern = self.canvas_kern.lock().unwrap();
             canvas_kern.reset();

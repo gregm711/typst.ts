@@ -183,7 +183,7 @@ impl Typst2VecPass {
                 }
             }
             VecItem::Group(g) => {
-                for (_, id) in g.0.iter() {
+                for (_, id) in g.items.iter() {
                     if !self.items.contains_key(id) {
                         self.intern(m, id);
                     }
@@ -284,7 +284,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                 let page_reg = self.spans.start();
 
                 let state = State::new(&doc.introspector, p.frame.size().into_typst());
-                let abs_ref = self.frame_(state, &p.frame, page_reg, idx, p.fill_or_transparent());
+                let abs_ref = self.frame_(state, &p.frame, page_reg, idx, p.fill_or_transparent(), None);
 
                 self.spans.push_span(SourceRegion {
                     region: doc_reg,
@@ -307,8 +307,8 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         pages
     }
 
-    fn frame(&self, state: State, frame: &Frame, parent: usize, index: usize) -> Fingerprint {
-        self.frame_(state, frame, parent, index, None)
+    fn frame(&self, state: State, frame: &Frame, parent: usize, index: usize, span: Option<Span>) -> Fingerprint {
+        self.frame_(state, frame, parent, index, None, span)
     }
 
     fn frame_(
@@ -318,6 +318,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         parent: usize,
         index: usize,
         fill: Option<Paint>,
+        span: Option<Span>,
     ) -> Fingerprint {
         let src_reg = self.spans.start();
 
@@ -360,7 +361,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                 FrameItem::Group(group) => {
                     let state = state.pre_concat(group.transform.into_typst());
 
-                    let mut inner = self.frame(state, &group.frame, src_reg, idx);
+                    let mut inner = self.frame(state, &group.frame, src_reg, idx, None);
 
                     if let Some(p) = group.clip.as_ref() {
                         // todo: merge
@@ -512,9 +513,10 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             }
         }
 
-        let g = self.store(VecItem::Group(GroupRef(
-            items.into_iter().map(|(x, _, y)| (x, y)).collect(),
-        )));
+        let g = self.store(VecItem::Group(GroupRef {
+            items: Arc::from_iter(items.into_iter().map(|(x, _, y)| (x, y))),
+            span_id: span.map(|s| s.into_raw().get()),
+        }));
 
         self.spans.push_span(SourceRegion {
             region: parent,
@@ -746,6 +748,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                             *glyph_id,
                         )
                     })),
+                    span_id: text.glyphs.first().map(|g| g.span.0.into_raw().get()),
                 }),
                 shape: Arc::new(TextShape {
                     font,
@@ -1118,7 +1121,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     }
 
     fn pattern(&self, state: State, g: &Tiling, transform: ir::Transform) -> Fingerprint {
-        let frame = self.frame(state, g.frame(), 0, 0);
+        let frame = self.frame(state, g.frame(), 0, 0, None);
 
         let item = self.store(VecItem::Pattern(Arc::new(PatternItem {
             frame,
@@ -1155,7 +1158,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         match child {
                             HtmlNode::Tag(..) => continue,
                             HtmlNode::Frame(e) => {
-                                HtmlChildren::Item(self.frame(state, &e.inner, parent, index))
+                                HtmlChildren::Item(self.frame(state, &e.inner, parent, index, None))
                             }
                             HtmlNode::Element(e) => {
                                 HtmlChildren::Item(self.html_element(state, e, parent, index))

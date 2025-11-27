@@ -132,7 +132,7 @@ impl TypstPageElem {
                 let mut ch = g.first_element_child();
 
                 let mut children = vec![];
-                for (p, fg) in gr.0.iter() {
+                for (p, fg) in gr.items.iter() {
                     #[cfg(feature = "debug_attach")]
                     web_sys::console::log_3(
                         &format!(

@@ -163,6 +163,10 @@ export class RenderSession {
     return (this[kObject] as typst.RenderSession).source_span(path);
   }
 
+  getSourceLocFromSpan(spanHex: string): string | undefined {
+    return (this[kObject] as typst.RenderSession).source_loc_from_span(spanHex);
+  }
+
   /**
    * See {@link TypstRenderer#renderSvg} for more details.
    */
@@ -900,6 +904,9 @@ export class TypstRendererDriver {
         }
         if (options.data_selection.js) {
           parts |= 1 << 3;
+        }
+        if (options.data_selection.source_map) {
+          parts |= 1 << 4;
         }
       }
 

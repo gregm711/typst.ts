@@ -92,6 +92,7 @@ export interface RenderSvgOptions {
     defs: boolean;
     css: boolean;
     js: boolean;
+    source_map?: boolean;
   };
 }
 

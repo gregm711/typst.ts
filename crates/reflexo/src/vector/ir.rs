@@ -82,11 +82,21 @@ pub struct VecDocument {
     /// References to the page frames.
     /// Use [`Module::get_item`] to get the actual item.
     pub pages: Vec<Page>,
+    /// Optional page-level metadata.
+    pub page_meta: Vec<PageMetadata>,
 }
 
 impl VecDocument {
     pub fn to_multi(self) -> MultiVecDocument {
-        let Self { pages, module } = self;
+        let Self {
+            pages,
+            module,
+            mut page_meta,
+        } = self;
+
+        if page_meta.is_empty() {
+            page_meta = Default::default();
+        }
 
         MultiVecDocument {
             module,
@@ -94,7 +104,7 @@ impl VecDocument {
                 kind: "width".into(),
                 layouts: vec![(
                     Default::default(),
-                    LayoutRegionNode::Pages(Arc::new((Default::default(), pages))),
+                    LayoutRegionNode::Pages(Arc::new((page_meta, pages))),
                 )],
             })],
         }

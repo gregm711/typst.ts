@@ -26,7 +26,7 @@ pollster.workspace = true
 tiny-skia.workspace = true
 
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde_json = { workspace = true }
 
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
@@ -61,11 +61,10 @@ vergen-gitcl.workspace = true
 [features]
 
 default = ["full"]
-full = ["serde_json", "render_full", "web_test"]
+full = ["render_full", "web_test"]
 
 web_test = ["typst-ts-test-common/web_artifacts"]
 web_verbose = ["web_test"]                        # for test debug
-serde_json = ["dep:serde", "dep:serde_json"]
 
 build_raw_font = []
 build_lazy_font = []

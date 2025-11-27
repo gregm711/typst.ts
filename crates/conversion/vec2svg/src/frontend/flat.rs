@@ -63,7 +63,11 @@ impl<Feat: ExportFeature> SvgExporter<Feat> {
         let pages = typst2vec.paged(output);
 
         let module = typst2vec.finalize();
-        VecDocument { pages, module }
+        VecDocument {
+            pages,
+            module,
+            page_meta: Vec::new(),
+        }
     }
 
     pub fn render_flat_svg(
