@@ -8,48 +8,6 @@ use wasm_bindgen::prelude::*;
 
 use crate::{RenderSession, TypstRenderer};
 
-fn update_file_map_from_meta(session: &RenderSession, meta: &[PageMetadata]) {
-    let mut map = session.file_map.lock().unwrap();
-    map.clear();
-
-    for m in meta {
-        if let PageMetadata::Custom(customs) = m {
-            for (k, v) in customs {
-                if k.as_ref() == "source_files" {
-                    if let Ok(entries) =
-                        serde_json::from_slice::<Vec<(u32, String)>>(v.as_ref())
-                    {
-                        for (id, path) in entries {
-                            map.insert(id, path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn update_span_map_from_meta(session: &RenderSession, meta: &[PageMetadata]) {
-    let mut map = session.span_map.lock().unwrap();
-    map.clear();
-
-    for m in meta {
-        if let PageMetadata::Custom(customs) = m {
-            for (k, v) in customs {
-                if k.as_ref() == "span_ranges" {
-                    if let Ok(entries) =
-                        serde_json::from_slice::<Vec<(u64, u32, usize, usize)>>(v.as_ref())
-                    {
-                        for (span_id, file_id, start, end) in entries {
-                            map.insert(span_id, (file_id, start, end));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[wasm_bindgen]
 impl RenderSession {
     pub fn render_in_window(
@@ -96,8 +54,7 @@ impl TypstRenderer {
         };
 
         let view = layout.pages(client.module()).unwrap();
-        update_file_map_from_meta(session, view.meta());
-        update_span_map_from_meta(session, view.meta());
+        session.update_metadata(&client);
 
         let parts = parts.map(|parts| SvgDataSelection {
             body: 0 != (parts & (1 << 0)),
@@ -167,8 +124,7 @@ impl TypstRenderer {
         }
 
         let view = layout.1.pages(client.module()).unwrap();
-        update_file_map_from_meta(session, view.meta());
-        update_span_map_from_meta(session, view.meta());
+        session.update_metadata(&client);
         let svg = UsingExporter::render_flat_svg(view.module(), view.pages(), None);
         drop(client);
 

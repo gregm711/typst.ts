@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use reflexo_typst::error::prelude::*;
 #[cfg(feature = "render_svg")]
 use reflexo_typst::svg::IncrSvgDocClient;
-use reflexo_typst::vector::ir::{Page, Scalar};
+use reflexo_typst::vector::ir::{Page, PageMetadata, Scalar};
 use reflexo_typst2vec::incr::IncrDocClient;
 #[cfg(feature = "render_canvas")]
 use reflexo_vec2canvas::IncrCanvasDocClient;
@@ -340,12 +340,63 @@ impl RenderSession {
             let mut svg_kern = self.svg_kern.lock().unwrap();
             svg_kern.reset();
         }
-        Self::merge_delta_inner(&mut self.pages_info, &mut client, delta)
+        let res = Self::merge_delta_inner(&mut self.pages_info, &mut client, delta);
+        self.update_metadata(&client);
+        res
     }
 
     pub(crate) fn merge_delta(&mut self, delta: &[u8]) -> Result<()> {
         let mut client = self.client.lock().unwrap();
-        Self::merge_delta_inner(&mut self.pages_info, &mut client, delta)
+        let res = Self::merge_delta_inner(&mut self.pages_info, &mut client, delta);
+        self.update_metadata(&client);
+        res
+    }
+
+    pub(crate) fn update_metadata(&self, client: &IncrDocClient) {
+        if let Some(layout) = &client.layout {
+            let view = layout.pages(client.module());
+            if let Some(view) = view {
+                let meta = view.meta();
+                
+                // Update file map
+                {
+                    let mut map = self.file_map.lock().unwrap();
+                    map.clear();
+                    for m in meta {
+                        if let PageMetadata::Custom(customs) = m {
+                            for (k, v) in customs {
+                                if k.as_ref() == "source_files" {
+                                    if let Ok(entries) = serde_json::from_slice::<Vec<(u32, String)>>(v.as_ref()) {
+                                        for (id, path) in entries {
+                                            map.insert(id, path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Update span map
+                {
+                    let mut map = self.span_map.lock().unwrap();
+                    map.clear();
+                    for m in meta {
+                        if let PageMetadata::Custom(customs) = m {
+                            for (k, v) in customs {
+                                if k.as_ref() == "span_ranges" {
+                                    if let Ok(entries) = serde_json::from_slice::<Vec<(u64, u32, usize, usize)>>(v.as_ref()) {
+                                        for (span_id, file_id, start, end) in entries {
+                                            map.insert(span_id, (file_id, start, end));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn merge_delta_inner(

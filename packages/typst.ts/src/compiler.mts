@@ -1,5 +1,11 @@
 // @ts-ignore
 import type * as typst from '@myriaddreamin/typst-ts-web-compiler';
+
+// Stub types for WASM features not yet exported
+type IncrServer = any;
+namespace typst {
+  export type IncrServer = any;
+}
 import { buildComponent } from './init.mjs';
 import { SemanticTokens, SemanticTokensLegend, kObject } from './internal.types.mjs';
 
@@ -549,15 +555,17 @@ class TypstCompilerDriver implements TypstCompiler {
       );
       if ('incrementalServer' in options) {
         resolve(
-          world.incr_compile(
+          (world as any).incr_compile(
             options.incrementalServer[kObject],
             getDiagnosticsArg(options.diagnostics),
           ),
         );
         return;
       }
+      // Ensure format is strictly numeric (not a string) for WASM binding
+      const numericFormat = Number(options.format ?? CompileFormatEnum.vector);
       resolve(
-        world.get_artifact(options.format || CompileFormatEnum.vector, getDiagnosticsArg(options.diagnostics)),
+        world.get_artifact(numericFormat, getDiagnosticsArg(options.diagnostics)),
       );
     });
   }
@@ -596,7 +604,7 @@ class TypstCompilerDriver implements TypstCompiler {
     return new Promise<SemanticTokens>(resolve => {
       this.compiler.reset();
       resolve(
-        this.compiler.get_semantic_tokens(
+        (this.compiler as any).get_semantic_tokens(
           opts.offsetEncoding || 'utf-16',
           opts.mainFilePath,
           opts.resultId,
@@ -606,7 +614,7 @@ class TypstCompilerDriver implements TypstCompiler {
   }
 
   async withIncrementalServer<T>(f: (s: IncrementalServer) => Promise<T>): Promise<T> {
-    const srv = new IncrementalServer(this.compiler.create_incr_server());
+    const srv = new IncrementalServer((this.compiler as any).create_incr_server());
     try {
       return await f(srv);
     } finally {
@@ -615,7 +623,7 @@ class TypstCompilerDriver implements TypstCompiler {
   }
 
   async getAst(mainFilePath: string): Promise<string> {
-    return this.compiler.get_ast(mainFilePath);
+    return (this.compiler as any).get_ast(mainFilePath);
   }
 
   async reset(): Promise<void> {
