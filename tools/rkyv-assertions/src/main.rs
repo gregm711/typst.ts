@@ -5,8 +5,8 @@ macro_rules! layout {
         $(layout!(@one $prim);)*
     };
     (@one $prim:ty) => {{
-        eprintln!("const _: () = assert!(core::mem::size_of::<{}>() == {});", stringify!($prim), core::mem::size_of::<$prim>());
-        eprintln!("const _: () = assert!(core::mem::align_of::<{}>() == {});", stringify!($prim), core::mem::align_of::<$prim>());
+        println!("const _: () = assert!(core::mem::size_of::<{}>() == {});", stringify!($prim), core::mem::size_of::<$prim>());
+        println!("const _: () = assert!(core::mem::align_of::<{}>() == {});", stringify!($prim), core::mem::align_of::<$prim>());
     }};
 }
 
@@ -18,14 +18,10 @@ fn main() {
         u16,
         u32,
         u64,
-        // forbidden
-        // u128,
         i8,
         i16,
         i32,
         i64,
-        // forbidden
-        // i128,
         f32,
         f64,
         char,
@@ -44,18 +40,15 @@ fn main() {
         ArchivedIncrGlyphPack,
         ArchivedPage,
         ArchivedBuildInfo,
-        // color
         ArchivedRgba8Item,
         ArchivedColor32Item,
         ArchivedColorSpace,
         ArchivedGradientItem,
         ArchivedGradientKind,
         ArchivedGradientStyle,
-        // layout
         ArchivedLayoutRegionNode,
         ArchivedLayoutRegion,
         ArchivedLayoutSourceMapping,
-        // text
         ArchivedImageGlyphItem,
         ArchivedOutlineGlyphItem,
         ArchivedFontItem,
@@ -63,7 +56,6 @@ fn main() {
         ArchivedTextItem,
         ArchivedTextItemContent,
         ArchivedFlatGlyphItem,
-        // visualize
         ArchivedImageItem,
         ArchivedImage,
         ArchivedPathItem,

@@ -52,15 +52,15 @@ pub mod vector {
         const _: () = assert!(core::mem::align_of::<ArchivedModuleMetadata>() == 4);
         const _: () = assert!(core::mem::size_of::<ArchivedTransformedRef>() == 24);
         const _: () = assert!(core::mem::align_of::<ArchivedTransformedRef>() == 8);
-        // const _: () = assert!(core::mem::size_of::<ArchivedGroupRef>() == 8);
-        // const _: () = assert!(core::mem::align_of::<ArchivedGroupRef>() == 4);
+        const _: () = assert!(core::mem::size_of::<ArchivedGroupRef>() == 24);
+        const _: () = assert!(core::mem::align_of::<ArchivedGroupRef>() == 8);
         const _: () = assert!(core::mem::size_of::<ArchivedItemPack>() == 8);
         const _: () = assert!(core::mem::align_of::<ArchivedItemPack>() == 4);
 // ...
         const _: () = assert!(core::mem::size_of::<ArchivedTextItem>() == 8);
         const _: () = assert!(core::mem::align_of::<ArchivedTextItem>() == 4);
-        // const _: () = assert!(core::mem::size_of::<ArchivedTextItemContent>() == 16);
-        // const _: () = assert!(core::mem::align_of::<ArchivedTextItemContent>() == 4);
+        const _: () = assert!(core::mem::size_of::<ArchivedTextItemContent>() == 32);
+        const _: () = assert!(core::mem::align_of::<ArchivedTextItemContent>() == 8);
         const _: () = assert!(core::mem::size_of::<ArchivedFlatGlyphItem>() == 8);
         const _: () = assert!(core::mem::align_of::<ArchivedFlatGlyphItem>() == 4);
         const _: () = assert!(core::mem::size_of::<ArchivedImageItem>() == 12);
