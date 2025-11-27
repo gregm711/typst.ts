@@ -7,12 +7,14 @@ use wasm_bindgen::prelude::*;
 #[wasm_bindgen]
 pub struct IncrServer {
     inner: IncrDocServer,
+    attach_debug_info: bool,
 }
 
 impl Default for IncrServer {
     fn default() -> Self {
         let mut this = Self {
             inner: IncrDocServer::default(),
+            attach_debug_info: true,
         };
         this.inner.set_should_attach_debug_info(true);
         this
@@ -31,6 +33,7 @@ impl IncrServer {
 #[wasm_bindgen]
 impl IncrServer {
     pub fn set_attach_debug_info(&mut self, attach: bool) {
+        self.attach_debug_info = attach;
         self.inner.set_should_attach_debug_info(attach);
     }
 
@@ -40,5 +43,6 @@ impl IncrServer {
 
     pub fn reset(&mut self) {
         self.inner = IncrDocServer::default();
+        self.inner.set_should_attach_debug_info(self.attach_debug_info);
     }
 }
