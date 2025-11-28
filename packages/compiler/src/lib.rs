@@ -480,14 +480,71 @@ impl TypstCompileWorld {
         let Some(doc) = self.do_compile_paged()? else {
             return self.get_diag::<TypstPagedDocument>(diagnostics_format);
         };
-        let v = Uint8Array::from(state.update(doc).as_slice()).into();
+        let delta_bytes = state.update(doc);
+        let v = Uint8Array::from(delta_bytes.as_slice()).into();
+
+        // Resolve span ranges from the world for source mapping
+        let span_ranges = self.resolve_span_ranges(&delta_bytes);
+        let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges)
+            .unwrap_or(JsValue::NULL);
+
         Ok(if diagnostics_format != 0 {
             let result = js_sys::Object::new();
             js_sys::Reflect::set(&result, &"result".into(), &v)?;
+            js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
             result.into()
         } else {
+            // For backwards compatibility, just return delta if no diag format
             v
         })
+    }
+
+    /// Resolve span IDs from delta to byte ranges using the world.
+    /// This walks the main source file's AST and resolves each span to byte offsets.
+    #[cfg(feature = "incr")]
+    fn resolve_span_ranges(&self, _delta_bytes: &[u8]) -> Vec<(String, u32, usize, usize)> {
+        use std::num::NonZeroU64;
+        use ::typst::World;
+
+        let mut result = Vec::new();
+        let world = &self.graph.snap.world;
+
+        // Get the main source file
+        let main_id = world.main();
+        if let Ok(source) = world.source(main_id) {
+            let file_id = main_id.into_raw().get() as u32;
+            let root = source.root();
+            Self::collect_spans_from_node(root, &source, file_id, &mut result);
+        }
+
+        result
+    }
+
+    #[cfg(feature = "incr")]
+    fn collect_spans_from_node(
+        node: &::typst::syntax::SyntaxNode,
+        source: &::typst::syntax::Source,
+        file_id: u32,
+        result: &mut Vec<(String, u32, usize, usize)>,
+    ) {
+        use std::num::NonZeroU64;
+
+        let span = node.span();
+        if !span.is_detached() {
+            // Use source.range(span) instead of world.range(span) to avoid locking
+            if let Some(range) = source.range(span) {
+                // Convert span to hex string like the renderer expects
+                if let Some(raw) = NonZeroU64::new(span.into_raw().get()) {
+                    let span_hex = format!("{:x}", raw.get());
+                    result.push((span_hex, file_id, range.start, range.end));
+                }
+            }
+        }
+
+        // Recurse into children
+        for child in node.children() {
+            Self::collect_spans_from_node(child, source, file_id, result);
+        }
     }
 
     fn get_diag<D: TypstDocumentTrait + Send + Sync + 'static>(
