@@ -26,6 +26,36 @@ use crate::utils::console_log;
 #[cfg(feature = "incr")]
 use incr::IncrServer;
 
+/// Line box for consistent cursor height.
+/// Represents a visual line inferred from text item Y positions.
+#[cfg(feature = "incr")]
+#[derive(serde::Serialize)]
+struct LineBox {
+    /// Page number (0-indexed)
+    page: u32,
+    /// Top Y position in points
+    top: f32,
+    /// Line height in points
+    height: f32,
+    /// Baseline Y position in points
+    baseline: f32,
+    /// Start byte offset in source
+    start_byte: usize,
+    /// End byte offset in source
+    end_byte: usize,
+}
+
+/// Intermediate text info for line box collection.
+#[cfg(feature = "incr")]
+struct TextInfo {
+    page: u32,
+    top: f32,
+    baseline: f32,
+    height: f32,
+    start_byte: usize,
+    end_byte: usize,
+}
+
 /// In format of
 ///
 /// ```log
@@ -480,18 +510,25 @@ impl TypstCompileWorld {
         let Some(doc) = self.do_compile_paged()? else {
             return self.get_diag::<TypstPagedDocument>(diagnostics_format);
         };
+
+        // Collect line boxes before updating state (we need the doc reference)
+        let line_boxes = self.collect_line_boxes(&doc);
+
         let delta_bytes = state.update(doc);
         let v = Uint8Array::from(delta_bytes.as_slice()).into();
 
         // Resolve span ranges from the world for source mapping
         let span_ranges = self.resolve_span_ranges(&delta_bytes);
-        let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges)
-            .unwrap_or(JsValue::NULL);
+        let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
+
+        // Serialize line boxes for cursor height consistency
+        let line_boxes_js = serde_wasm_bindgen::to_value(&line_boxes).unwrap_or(JsValue::NULL);
 
         Ok(if diagnostics_format != 0 {
             let result = js_sys::Object::new();
             js_sys::Reflect::set(&result, &"result".into(), &v)?;
             js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
+            js_sys::Reflect::set(&result, &"lineBoxes".into(), &line_boxes_js)?;
             result.into()
         } else {
             // For backwards compatibility, just return delta if no diag format
@@ -503,7 +540,6 @@ impl TypstCompileWorld {
     /// This walks the main source file's AST and resolves each span to byte offsets.
     #[cfg(feature = "incr")]
     fn resolve_span_ranges(&self, _delta_bytes: &[u8]) -> Vec<(String, u32, usize, usize)> {
-        use std::num::NonZeroU64;
         use ::typst::World;
 
         let mut result = Vec::new();
@@ -544,6 +580,177 @@ impl TypstCompileWorld {
         // Recurse into children
         for child in node.children() {
             Self::collect_spans_from_node(child, source, file_id, result);
+        }
+    }
+
+    /// Collect line boxes from the laid-out document.
+    /// Groups text items by Y position to infer visual lines,
+    /// providing consistent cursor height for the editor.
+    #[cfg(feature = "incr")]
+    fn collect_line_boxes(&self, doc: &TypstPagedDocument) -> Vec<LineBox> {
+        use ::typst::layout::Point as TypstPoint;
+        use ::typst::World;
+
+        let world = &self.graph.snap.world;
+        let main_id = world.main();
+        let source = match world.source(main_id) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut text_infos: Vec<TextInfo> = Vec::new();
+
+        for (page_idx, page) in doc.pages.iter().enumerate() {
+            Self::collect_text_from_frame(
+                page_idx as u32,
+                &page.frame,
+                TypstPoint::zero(),
+                &source,
+                &mut text_infos,
+            );
+        }
+
+        if text_infos.is_empty() {
+            return Vec::new();
+        }
+
+        // Sort by page, then by Y position
+        text_infos.sort_by(|a, b| {
+            a.page.cmp(&b.page).then_with(|| {
+                a.top
+                    .partial_cmp(&b.top)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+        });
+
+        // Group into lines by Y proximity (3pt tolerance)
+        const Y_TOLERANCE: f32 = 3.0;
+        let mut lines: Vec<LineBox> = Vec::new();
+        let mut current_line: Option<LineBox> = None;
+
+        for info in text_infos {
+            if let Some(ref mut line) = current_line {
+                // Check if same page and Y within tolerance
+                if line.page == info.page && (info.top - line.top).abs() < Y_TOLERANCE {
+                    // Extend current line
+                    line.height = line.height.max(info.height);
+                    line.baseline = line.baseline.max(info.baseline);
+                    line.start_byte = line.start_byte.min(info.start_byte);
+                    line.end_byte = line.end_byte.max(info.end_byte);
+                } else {
+                    // Start new line
+                    lines.push(current_line.take().unwrap());
+                    current_line = Some(LineBox {
+                        page: info.page,
+                        top: info.top,
+                        height: info.height,
+                        baseline: info.baseline,
+                        start_byte: info.start_byte,
+                        end_byte: info.end_byte,
+                    });
+                }
+            } else {
+                // First line
+                current_line = Some(LineBox {
+                    page: info.page,
+                    top: info.top,
+                    height: info.height,
+                    baseline: info.baseline,
+                    start_byte: info.start_byte,
+                    end_byte: info.end_byte,
+                });
+            }
+        }
+
+        // Don't forget the last line
+        if let Some(line) = current_line {
+            lines.push(line);
+        }
+
+        // Ensure minimum line height (12pt)
+        const MIN_LINE_HEIGHT: f32 = 12.0;
+        for line in &mut lines {
+            if line.height < MIN_LINE_HEIGHT {
+                line.height = MIN_LINE_HEIGHT;
+            }
+        }
+
+        lines
+    }
+
+    /// Recursively collect text items from a frame with their absolute positions.
+    /// Note: We accumulate offsets through recursion rather than applying full
+    /// transform matrices, as we only need Y positions for line box grouping.
+    #[cfg(feature = "incr")]
+    fn collect_text_from_frame(
+        page: u32,
+        frame: &::typst::layout::Frame,
+        offset: ::typst::layout::Point,
+        source: &::typst::syntax::Source,
+        out: &mut Vec<TextInfo>,
+    ) {
+        use ::typst::layout::{FrameItem, Point as TypstPoint};
+
+        for (pos, item) in frame.items() {
+            // Accumulate position offsets
+            let abs_pos = TypstPoint::new(offset.x + pos.x, offset.y + pos.y);
+
+            match item {
+                FrameItem::Group(group) => {
+                    // For groups with transforms, we apply the translation component
+                    // (transforms like rotation/scale are less common for text lines)
+                    let group_offset = TypstPoint::new(
+                        abs_pos.x + group.transform.tx,
+                        abs_pos.y + group.transform.ty,
+                    );
+                    Self::collect_text_from_frame(
+                        page,
+                        &group.frame,
+                        group_offset,
+                        source,
+                        out,
+                    );
+                }
+                FrameItem::Text(text) => {
+                    // Get text metrics using Em's .get() method (returns ratio of font size)
+                    // Then scale by font size to get actual length
+                    let font_metrics = text.font.metrics();
+                    let font_size = text.size.to_pt() as f32;
+                    let ascender = font_metrics.ascender.get() as f32 * font_size;
+                    let descender = font_metrics.descender.get() as f32 * font_size;
+                    let height = (ascender - descender).abs();
+
+                    // Y position is at the baseline; top = baseline - ascender
+                    let baseline = abs_pos.y.to_pt() as f32;
+                    let top = baseline - ascender;
+
+                    // Get byte range from spans
+                    let mut start_byte = usize::MAX;
+                    let mut end_byte = 0usize;
+
+                    for glyph in &text.glyphs {
+                        let span = glyph.span.0;
+                        if !span.is_detached() {
+                            if let Some(range) = source.range(span) {
+                                start_byte = start_byte.min(range.start);
+                                end_byte = end_byte.max(range.end);
+                            }
+                        }
+                    }
+
+                    if start_byte != usize::MAX && end_byte > 0 {
+                        out.push(TextInfo {
+                            page,
+                            top,
+                            baseline,
+                            height,
+                            start_byte,
+                            end_byte,
+                        });
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
