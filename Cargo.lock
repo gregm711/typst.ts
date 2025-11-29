@@ -5596,6 +5596,7 @@ dependencies = [
  "reflexo-typst",
  "reflexo-typst2vec",
  "reflexo-vec2svg",
+ "serde",
  "serde-wasm-bindgen",
  "serde_json",
  "sha2",

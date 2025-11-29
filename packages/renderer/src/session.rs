@@ -256,15 +256,13 @@ impl RenderSession {
         // Assume single-file main.typ unless we ship a file table.
         let filepath = {
             let map = self.file_map.lock().unwrap();
-            map.get(&(file_id as u32))
-                .cloned()
-                .unwrap_or_else(|| {
-                    if file_id == 0 {
-                        "/main.typ".to_string()
-                    } else {
-                        format!("file-{file_id}")
-                    }
-                })
+            map.get(&(file_id as u32)).cloned().unwrap_or_else(|| {
+                if file_id == 0 {
+                    "/main.typ".to_string()
+                } else {
+                    format!("file-{file_id}")
+                }
+            })
         };
 
         if let Some((f_id, start, end)) = self.span_map.lock().unwrap().get(&raw) {
@@ -357,7 +355,7 @@ impl RenderSession {
             let view = layout.pages(client.module());
             if let Some(view) = view {
                 let meta = view.meta();
-                
+
                 // Update file map
                 {
                     let mut map = self.file_map.lock().unwrap();
@@ -366,7 +364,9 @@ impl RenderSession {
                         if let PageMetadata::Custom(customs) = m {
                             for (k, v) in customs {
                                 if k.as_ref() == "source_files" {
-                                    if let Ok(entries) = serde_json::from_slice::<Vec<(u32, String)>>(v.as_ref()) {
+                                    if let Ok(entries) =
+                                        serde_json::from_slice::<Vec<(u32, String)>>(v.as_ref())
+                                    {
                                         for (id, path) in entries {
                                             map.insert(id, path);
                                         }
@@ -385,7 +385,11 @@ impl RenderSession {
                         if let PageMetadata::Custom(customs) = m {
                             for (k, v) in customs {
                                 if k.as_ref() == "span_ranges" {
-                                    if let Ok(entries) = serde_json::from_slice::<Vec<(u64, u32, usize, usize)>>(v.as_ref()) {
+                                    if let Ok(entries) =
+                                        serde_json::from_slice::<Vec<(u64, u32, usize, usize)>>(
+                                            v.as_ref(),
+                                        )
+                                    {
                                         for (span_id, file_id, start, end) in entries {
                                             map.insert(span_id, (file_id, start, end));
                                         }

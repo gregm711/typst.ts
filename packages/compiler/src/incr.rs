@@ -43,6 +43,7 @@ impl IncrServer {
 
     pub fn reset(&mut self) {
         self.inner = IncrDocServer::default();
-        self.inner.set_should_attach_debug_info(self.attach_debug_info);
+        self.inner
+            .set_should_attach_debug_info(self.attach_debug_info);
     }
 }

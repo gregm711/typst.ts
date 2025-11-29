@@ -338,12 +338,8 @@ where
         next: &ir::GroupRef,
     ) {
         if let Some(ir::VecItem::Group(prev_group)) = prev_item_ {
-            let mut unused_prev: BTreeMap<usize, Fingerprint> = prev_group
-                .items
-                .iter()
-                .map(|v| v.1)
-                .enumerate()
-                .collect();
+            let mut unused_prev: BTreeMap<usize, Fingerprint> =
+                prev_group.items.iter().map(|v| v.1).enumerate().collect();
             let reusable: HashSet<Fingerprint, RandomState> =
                 HashSet::from_iter(prev_group.items.iter().map(|e| e.1));
 

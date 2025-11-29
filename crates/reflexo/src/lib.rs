@@ -56,7 +56,7 @@ pub mod vector {
         const _: () = assert!(core::mem::align_of::<ArchivedGroupRef>() == 8);
         const _: () = assert!(core::mem::size_of::<ArchivedItemPack>() == 8);
         const _: () = assert!(core::mem::align_of::<ArchivedItemPack>() == 4);
-// ...
+        // ...
         const _: () = assert!(core::mem::size_of::<ArchivedTextItem>() == 8);
         const _: () = assert!(core::mem::align_of::<ArchivedTextItem>() == 4);
         const _: () = assert!(core::mem::size_of::<ArchivedTextItemContent>() == 32);

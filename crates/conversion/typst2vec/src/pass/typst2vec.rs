@@ -284,7 +284,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                 let page_reg = self.spans.start();
 
                 let state = State::new(&doc.introspector, p.frame.size().into_typst());
-                let abs_ref = self.frame_(state, &p.frame, page_reg, idx, p.fill_or_transparent(), None);
+                let abs_ref = self.frame_(
+                    state,
+                    &p.frame,
+                    page_reg,
+                    idx,
+                    p.fill_or_transparent(),
+                    None,
+                );
 
                 self.spans.push_span(SourceRegion {
                     region: doc_reg,
@@ -307,7 +314,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         pages
     }
 
-    fn frame(&self, state: State, frame: &Frame, parent: usize, index: usize, span: Option<Span>) -> Fingerprint {
+    fn frame(
+        &self,
+        state: State,
+        frame: &Frame,
+        parent: usize,
+        index: usize,
+        span: Option<Span>,
+    ) -> Fingerprint {
         self.frame_(state, frame, parent, index, None, span)
     }
 

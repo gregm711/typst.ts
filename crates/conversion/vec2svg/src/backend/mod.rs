@@ -541,7 +541,8 @@ impl<
         self.attributes.push(("class", "typst-group".to_owned()));
         if let Some(span_id) = group.span_id {
             if _ctx.should_attach_debug_info() {
-                self.attributes.push(("data-span", format!("{:x}", span_id)));
+                self.attributes
+                    .push(("data-span", format!("{:x}", span_id)));
             }
         }
         self

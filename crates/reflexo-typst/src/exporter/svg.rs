@@ -80,22 +80,24 @@ impl<EF: ExportFeature, F: CompilerFeat> ExportComputation<F, TypstPagedDocument
         }
 
         if !files.is_empty() {
-            let payload = serde_json::to_vec(&files).map_err(|e| {
-                error_once!("serialize file table failed", err: e.to_string())
-            })?;
-            vec_doc.page_meta.push(reflexo::vector::ir::PageMetadata::Custom(vec![(
-                "source_files".into(),
-                payload.into(),
-            )]));
+            let payload = serde_json::to_vec(&files)
+                .map_err(|e| error_once!("serialize file table failed", err: e.to_string()))?;
+            vec_doc
+                .page_meta
+                .push(reflexo::vector::ir::PageMetadata::Custom(vec![(
+                    "source_files".into(),
+                    payload.into(),
+                )]));
         }
         if !span_ranges.is_empty() {
-            let payload = serde_json::to_vec(&span_ranges).map_err(|e| {
-                error_once!("serialize span ranges failed", err: e.to_string())
-            })?;
-            vec_doc.page_meta.push(reflexo::vector::ir::PageMetadata::Custom(vec![(
-                "span_ranges".into(),
-                payload.into(),
-            )]));
+            let payload = serde_json::to_vec(&span_ranges)
+                .map_err(|e| error_once!("serialize span ranges failed", err: e.to_string()))?;
+            vec_doc
+                .page_meta
+                .push(reflexo::vector::ir::PageMetadata::Custom(vec![(
+                    "span_ranges".into(),
+                    payload.into(),
+                )]));
         }
 
         Ok(Bytes::new(vec_doc.to_bytes()))
