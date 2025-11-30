@@ -344,4 +344,5 @@ mod tests {
         println!("  '\\n' (0x{:02x}) → line frame: {}", newline_hint as u32, newline_hint != '\0');
         println!("  ' '  (0x{:02x}) → line frame: {}", space_hint as u32, space_hint != '\0');
     }
+
 }

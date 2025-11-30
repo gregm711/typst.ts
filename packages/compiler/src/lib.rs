@@ -10,6 +10,9 @@ mod debug_line_boxes;
 #[cfg(all(test, feature = "incr"))]
 mod test_ieee_template;
 
+#[cfg(all(test, feature = "incr"))]
+mod test_glyph_maps;
+
 pub use crate::builder::TypstFontResolver;
 pub use reflexo_typst::*;
 
@@ -49,6 +52,44 @@ pub(crate) struct LineBox {
     start_byte: usize,
     /// End byte offset in source
     end_byte: usize,
+}
+
+/// Glyph map for a single text span.
+/// Maps each visual glyph index to its byte offset in source.
+/// This enables accurate click-to-cursor positioning without heuristics.
+#[cfg(feature = "incr")]
+#[derive(serde::Serialize)]
+pub(crate) struct SpanGlyphMap {
+    /// Span ID (hex string matching data-span in SVG)
+    #[serde(rename = "spanId")]
+    span_id: String,
+    /// Byte offset for each glyph. Index i = glyph i's start byte.
+    /// Length is glyphs.len() + 1 to include end position.
+    #[serde(rename = "byteOffsets")]
+    byte_offsets: Vec<usize>,
+}
+
+/// Glyph maps grouped by page for efficient transfer.
+#[cfg(feature = "incr")]
+#[derive(serde::Serialize)]
+pub(crate) struct PageGlyphMap {
+    /// Page number (0-indexed)
+    page: u32,
+    /// Version for cache invalidation
+    version: u32,
+    /// Glyph maps for all text spans on this page
+    spans: Vec<SpanGlyphMap>,
+}
+
+/// Internal helper for geometric line verification.
+#[cfg(feature = "incr")]
+#[derive(Clone)]
+struct TextItemInfo {
+    baseline: f64,
+    top: f64,
+    bottom: f64,
+    start: usize,
+    end: usize,
 }
 
 /// Syntax node information for editor protection.
@@ -190,10 +231,10 @@ impl TransformState {
 }
 
 #[cfg(feature = "incr")]
-fn console_log(msg: impl AsRef<str>) {
+fn console_log(_msg: impl AsRef<str>) {
     #[cfg(target_arch = "wasm32")]
     {
-        web_sys::console::log_1(&msg.as_ref().into());
+        web_sys::console::log_1(&_msg.as_ref().into());
     }
 }
 
@@ -655,6 +696,9 @@ impl TypstCompileWorld {
         // Collect line boxes before updating state (we need the doc reference)
         let line_boxes = self.collect_line_boxes(&doc);
 
+        // Collect glyph maps for accurate click-to-cursor positioning
+        let glyph_maps = self.collect_glyph_maps(&doc);
+
         let delta_bytes = state.update(doc);
         let v = Uint8Array::from(delta_bytes.as_slice()).into();
 
@@ -665,18 +709,38 @@ impl TypstCompileWorld {
         // Serialize line boxes for cursor height consistency
         let line_boxes_js = serde_wasm_bindgen::to_value(&line_boxes).unwrap_or(JsValue::NULL);
 
+        // Serialize glyph maps for accurate click positioning
+        let glyph_maps_js = match serde_wasm_bindgen::to_value(&glyph_maps) {
+            Ok(v) => {
+                console_log(format!(
+                    "[incr_compile] Serialized glyph maps: {} pages, is_null={}",
+                    glyph_maps.len(),
+                    v.is_null()
+                ));
+                v
+            }
+            Err(e) => {
+                console_log(format!("[incr_compile] ERROR serializing glyph maps: {:?}", e));
+                JsValue::NULL
+            }
+        };
+
         // Collect syntax nodes for editor protection (headings, lists, math, etc.)
         let syntax_nodes = self.collect_syntax_nodes();
         let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
 
         Ok(if diagnostics_format != 0 {
+            console_log(format!("[incr_compile] Building result object with diagnostics_format={}", diagnostics_format));
             let result = js_sys::Object::new();
             js_sys::Reflect::set(&result, &"result".into(), &v)?;
             js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
             js_sys::Reflect::set(&result, &"lineBoxes".into(), &line_boxes_js)?;
+            js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
             js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
+            console_log(format!("[incr_compile] Result object created, glyphMaps set (value is_null={})", glyph_maps_js.is_null()));
             result.into()
         } else {
+            console_log("[incr_compile] diagnostics_format is 0, returning raw delta (no glyphMaps)".to_string());
             // For backwards compatibility, just return delta if no diag format
             v
         })
@@ -1010,6 +1074,188 @@ impl TypstCompileWorld {
         lines
     }
 
+    /// Collect glyph maps from the laid-out document.
+    /// For each text item, extract the per-glyph byte offsets from the span data.
+    /// This enables accurate click-to-cursor positioning.
+    #[cfg(feature = "incr")]
+    fn collect_glyph_maps(&self, doc: &TypstPagedDocument) -> Vec<PageGlyphMap> {
+        use ::typst::World;
+
+        let world = &self.graph.snap.world;
+        let main_id = world.main();
+        let source = match world.source(main_id) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut page_maps: Vec<PageGlyphMap> = Vec::new();
+
+        for (page_idx, page) in doc.pages.iter().enumerate() {
+            let mut spans: Vec<SpanGlyphMap> = Vec::new();
+
+            Self::collect_glyphs_from_frame(&page.frame, &source, &mut spans);
+
+            if !spans.is_empty() {
+                page_maps.push(PageGlyphMap {
+                    page: page_idx as u32,
+                    version: 1, // Increment on each compile if caching
+                    spans,
+                });
+            }
+        }
+
+        console_log(format!(
+            "[collect_glyph_maps] Collected {} pages with glyph maps",
+            page_maps.len()
+        ));
+
+        page_maps
+    }
+
+    /// Recursively collect glyph byte offsets from text items in a frame.
+    ///
+    /// IMPORTANT: When text wraps to multiple lines, Typst creates multiple
+    /// FrameItem::Text entries with the SAME span_id but at different Y positions.
+    /// The client groups these by spanId into "chunks" for proper cursor placement.
+    #[cfg(feature = "incr")]
+    fn collect_glyphs_from_frame(
+        frame: &::typst::layout::Frame,
+        source: &::typst::syntax::Source,
+        result: &mut Vec<SpanGlyphMap>,
+    ) {
+        use ::typst::layout::FrameItem;
+        use std::num::NonZeroU64;
+
+        for (pos, item) in frame.items() {
+            match item {
+                FrameItem::Group(group) => {
+                    Self::collect_glyphs_from_frame(&group.frame, source, result);
+                }
+                FrameItem::Text(text) => {
+                    // Get the span ID from the first glyph
+                    // NOTE: For wrapped text, multiple FrameItem::Text may have the same span
+                    if let Some(first_glyph) = text.glyphs.first() {
+                        let span = first_glyph.span.0;
+                        if !span.is_detached() {
+                            if let Some(raw) = NonZeroU64::new(span.into_raw().get()) {
+                                let span_id = format!("{:x}", raw.get());
+
+                                // Debug: Count how many times we've seen this span_id already
+                                let existing_count = result.iter().filter(|m| m.span_id == span_id).count();
+
+                                // ALWAYS log for debugging wrapped text issues
+                                // Check if all glyphs share the same SourceSpan or if they differ
+                                let mut unique_spans = std::collections::HashSet::new();
+                                for g in text.glyphs.iter() {
+                                    if let Some(r) = NonZeroU64::new(g.span.0.into_raw().get()) {
+                                        unique_spans.insert(r.get());
+                                    }
+                                }
+
+                                console_log(format!(
+                                    "[GlyphMap] span={} pos=({:.1},{:.1}) glyphs={} unique_glyph_spans={} existing_chunks={} first_local_offset={}",
+                                    &span_id[..8.min(span_id.len())],
+                                    pos.x.to_pt(),
+                                    pos.y.to_pt(),
+                                    text.glyphs.len(),
+                                    unique_spans.len(),
+                                    existing_count,
+                                    first_glyph.span.1
+                                ));
+
+                                // Collect byte offsets for each glyph
+                                // IMPORTANT: Each glyph has its own span info (span.0 = SourceSpan, span.1 = local offset)
+                                // We need to resolve each glyph's absolute byte position individually
+                                let mut byte_offsets: Vec<usize> = Vec::with_capacity(text.glyphs.len() + 1);
+
+                                let mut all_resolved = true;
+                                for (idx, glyph) in text.glyphs.iter().enumerate() {
+                                    // Each glyph has its own span and local offset
+                                    let glyph_span = glyph.span.0;
+                                    let local_offset = glyph.span.1 as usize;
+
+                                    // Get absolute byte position for this glyph - NO HEURISTICS
+                                    // If we can't resolve the span, we skip this entire text item
+                                    if let Some(range) = source.range(glyph_span) {
+                                        let byte_pos = range.start + local_offset;
+
+                                        // Debug first few glyphs
+                                        if idx < 3 || idx == text.glyphs.len() - 1 {
+                                            let glyph_span_raw = NonZeroU64::new(glyph_span.into_raw().get())
+                                                .map(|r| format!("{:x}", r.get()))
+                                                .unwrap_or_else(|| "detached".to_string());
+                                            console_log(format!(
+                                                "[GlyphMap] span={} glyph[{}]: local_offset={}, byte_pos={}, glyph_span={}",
+                                                &span_id[..8.min(span_id.len())],
+                                                idx,
+                                                local_offset,
+                                                byte_pos,
+                                                &glyph_span_raw[..8.min(glyph_span_raw.len())]
+                                            ));
+                                        }
+
+                                        byte_offsets.push(byte_pos);
+                                    } else {
+                                        // Can't resolve this glyph's span - skip entire text item
+                                        // to avoid emitting partial/incorrect data
+                                        all_resolved = false;
+                                        console_log(format!(
+                                            "[GlyphMap] span={} glyph[{}]: UNRESOLVED span, skipping text item",
+                                            &span_id[..8.min(span_id.len())],
+                                            idx
+                                        ));
+                                        break;
+                                    }
+                                }
+
+                                // Only proceed if all glyphs were resolved
+                                if !all_resolved {
+                                    continue;
+                                }
+
+                                // Add end position (byte after last glyph)
+                                // BUG FIX: We were using `range.end` which is the end of the ENTIRE
+                                // source span (e.g., byte 191 for all text items in a paragraph).
+                                // This caused overlapping byte ranges across lines, breaking
+                                // byte->chunk resolution for wrapped text.
+                                //
+                                // CORRECT: Use range.start + last_glyph.span.1 + 1
+                                // This gives the byte position AFTER the last glyph in this text item.
+                                if let Some(last_glyph) = text.glyphs.last() {
+                                    let last_span = last_glyph.span.0;
+                                    let last_local_offset = last_glyph.span.1 as usize;
+                                    if let Some(range) = source.range(last_span) {
+                                        // End position = start of span + local offset of last glyph + 1
+                                        // The +1 accounts for the glyph itself (assumes 1-byte chars;
+                                        // for multi-byte UTF-8, the next glyph's offset will be used)
+                                        let end_byte = range.start + last_local_offset + 1;
+                                        byte_offsets.push(end_byte);
+                                    } else {
+                                        // Can't resolve end position - skip this text item
+                                        console_log(format!(
+                                            "[GlyphMap] span={}: UNRESOLVED end span, skipping",
+                                            &span_id[..8.min(span_id.len())]
+                                        ));
+                                        continue;
+                                    }
+                                } else {
+                                    // No glyphs - skip
+                                    continue;
+                                }
+
+                                result.push(SpanGlyphMap {
+                                    span_id,
+                                    byte_offsets,
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Debug: print frame tree to understand hierarchy
     #[cfg(feature = "incr")]
     fn debug_print_frame_tree(frame: &::typst::layout::Frame, depth: usize, max_depth: usize) {
@@ -1082,6 +1328,10 @@ impl TypstCompileWorld {
     /// IMPORTANT: Block containers may have content_hint set on them (from collect.rs:449),
     /// but they contain child line frames with more granular hints. We should prefer
     /// the innermost line frames to get accurate per-line byte ranges.
+    ///
+    /// UPDATE: We now use a hybrid approach. We traverse using hints, but at the leaf level,
+    /// we verify the content geometrically (clustering Y-positions) to ensure we don't
+    /// inadvertently emit a single LineBox for a multi-line block that masked itself as a line.
     #[cfg(feature = "incr")]
     pub(crate) fn collect_lines_from_frame(
         page: u32,
@@ -1099,6 +1349,8 @@ impl TypstCompileWorld {
         // Track how many line boxes we have before traversing children so we can tell
         // whether a candidate frame actually contains nested line frames.
         let before_children = out.len();
+        // Track whether this frame has any direct text items (helps distinguish containers)
+        let mut direct_text_count = 0usize;
 
         // Debug: log traversal to first line frame only
         static DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1107,117 +1359,191 @@ impl TypstCompileWorld {
             // Apply position offset within this frame (pre_translate like typst2vec)
             let child_transform = transform.pre_translate(pos.x.to_pt(), pos.y.to_pt());
 
-            if let FrameItem::Group(group) = item {
-                let gt = &group.transform;
+            match item {
+                FrameItem::Group(group) => {
+                    let gt = &group.transform;
 
-                // Debug: log the path to first line only
-                if out.is_empty() {
-                    let depth = DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if depth < 10 {
-                        let has_hint = group.frame.content_hint() != '\0';
-                        console_log(format!(
-                            "[Traverse d={}] pos=({:.2}, {:.2})pt → ty={:.2}pt | gt=({:.4}, {:.2})pt | is_line={}",
-                            depth,
-                            pos.x.to_pt(),
-                            pos.y.to_pt(),
-                            child_transform.pos_y(),
-                            gt.sy.get(),
-                            gt.ty.to_pt(),
-                            has_hint
-                        ));
+                    // Debug: log the path to first line only
+                    if out.is_empty() {
+                        let depth = DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if depth < 10 {
+                            let has_hint = group.frame.content_hint() != '\0';
+                            console_log(format!(
+                                "[Traverse d={}] pos=({:.2}, {:.2})pt → ty={:.2}pt | gt=({:.4}, {:.2})pt | is_line={}",
+                                depth,
+                                pos.x.to_pt(),
+                                pos.y.to_pt(),
+                                child_transform.pos_y(),
+                                gt.sy.get(),
+                                gt.ty.to_pt(),
+                                has_hint
+                            ));
+                        }
                     }
-                }
 
-                // Apply the group's transform (pre_concat like typst2vec)
-                let group_transform = child_transform.pre_concat(&group.transform);
-                Self::collect_lines_from_frame(
-                    page,
-                    &group.frame,
-                    group_transform,
-                    source,
-                    out,
-                );
+                    // Apply the group's transform (pre_concat like typst2vec)
+                    let group_transform = child_transform.pre_concat(&group.transform);
+                    Self::collect_lines_from_frame(
+                        page,
+                        &group.frame,
+                        group_transform,
+                        source,
+                        out,
+                    );
+                }
+                FrameItem::Text(_) => {
+                    direct_text_count += 1;
+                }
+                _ => {}
             }
         }
 
-            let child_lines_added = out.len() > before_children;
+        let child_lines_added = out.len() > before_children;
 
-            if is_line_candidate {
-                if child_lines_added {
-                    // This frame marks a block, but nested frames contained the real lines.
-                if out.len() < 3 {
-                    console_log(format!(
-                        "[LineFrame CONTAINER] hint='{}' (0x{:02x}) - used child line frames",
-                        if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
-                        hint as u32,
-                    ));
-                }
-                return;
-            }
+        if !is_line_candidate {
+            return;
+        }
 
-            // No child line frames were found; treat this frame as the line.
+        if child_lines_added {
+            // This frame marks a block, but nested frames contained the real lines.
             if out.len() < 3 {
                 console_log(format!(
-                    "[LineFrame LEAF] hint='{}' (0x{:02x}), transform.ty={:.2}pt",
+                    "[LineFrame CONTAINER] hint='{}' (0x{:02x}) - used child line frames",
                     if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
                     hint as u32,
-                    transform.pos_y()
                 ));
             }
+            return;
+        }
 
-            // Prefer actual glyph bounds for vertical metrics; fallback to frame height.
-            let mut min_y = f64::INFINITY;
-            let mut max_y = f64::NEG_INFINITY;
-            Self::collect_text_bounds_from_frame(frame, transform, &mut min_y, &mut max_y);
+        // No child line frames were found; treat this frame as the leaf candidate.
+        if out.len() < 3 {
+            console_log(format!(
+                "[LineFrame LEAF] hint='{}' (0x{:02x}), transform.ty={:.2}pt",
+                if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
+                hint as u32,
+                transform.pos_y()
+            ));
+        }
 
-            let baseline_y = transform.apply_to_point(0.0, frame.baseline().to_pt()).1 as f32;
-            let (top, height) = if min_y.is_finite() && max_y.is_finite() && max_y > min_y {
-                (min_y as f32, (max_y - min_y) as f32)
-            } else {
-                (
-                    transform.pos_y() as f32,
-                    (frame.height().to_pt() * transform.scale_y()) as f32,
-                )
-            };
+        // Hybrid Approach: verify content geometrically.
+        let mut text_infos = Vec::new();
+        Self::collect_text_infos_from_frame(frame, transform, source, &mut text_infos);
 
-            let mut start_byte = usize::MAX;
-            let mut end_byte = 0usize;
-            Self::collect_byte_range_from_frame(frame, source, &mut start_byte, &mut end_byte);
-
-            // In tests we sometimes construct synthetic frames without real spans.
-            // Provide a minimal byte range so we can still validate traversal logic.
+        if text_infos.is_empty() {
+            // No text collected. In tests we still want synthetic frames to emit.
             #[cfg(test)]
-            if start_byte == usize::MAX && end_byte == 0 {
-                start_byte = 0;
-                end_byte = 1;
-            }
-
-            if start_byte != usize::MAX {
-                let line_num = out.len();
-                if line_num < 5 {
-                    console_log(format!(
-                        "[LineBox #{}] ty={:.2}pt, sy={:.4}, frame.h={:.2}pt → top={:.2}pt, bytes={}..{}",
-                        line_num,
-                        transform.pos_y(),
-                        transform.scale_y(),
-                        frame.height().to_pt(),
-                        top,
-                        start_byte,
-                        end_byte
-                    ));
-                }
-            }
-
-            if start_byte != usize::MAX && end_byte > 0 {
+            {
+                let baseline_y = transform.apply_to_point(0.0, frame.baseline().to_pt()).1 as f32;
+                let top = transform.pos_y() as f32;
+                let height = (frame.height().to_pt() * transform.scale_y()) as f32;
                 out.push(LineBox {
                     page,
                     top,
                     height,
                     baseline: baseline_y,
-                    start_byte,
-                    end_byte,
+                    start_byte: 0,
+                    end_byte: 1,
                 });
             }
+            #[cfg(not(test))]
+            {
+                return;
+            }
+        }
+
+        // Heuristic guard: if a hinted frame has NO direct text AND a very large span,
+        // treat it as a container and skip emitting a line box to avoid overlaps.
+        // (Title case: small span with direct text passes through.)
+        if direct_text_count == 0 {
+            let start_min = text_infos.iter().map(|i| i.start).min().unwrap_or(0);
+            let end_max = text_infos.iter().map(|i| i.end).max().unwrap_or(0);
+            if end_max > start_min {
+                let span = end_max - start_min;
+                if span > 500 {
+                    if out.len() < 3 {
+                        console_log(format!(
+                            "[LineFrame DROP] hint='{}' span={} (no direct text) at ty={:.2}pt",
+                            if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
+                            span,
+                            transform.pos_y()
+                        ));
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Sort by baseline Y to enable clustering
+        text_infos.sort_by(|a, b| a.baseline.partial_cmp(&b.baseline).unwrap());
+
+        // Determine tolerance based on max glyph height in this frame
+        // (handle large titles vs small text dynamically)
+        let max_height = text_infos
+            .iter()
+            .map(|i| (i.bottom - i.top) as f32)
+            .fold(0.0f32, f32::max);
+        // Tolerance is 50% of max height, but at least 2.0pt
+        let tolerance = (max_height as f64 * 0.5).max(2.0);
+
+        // Cluster items by vertical position
+        let mut clusters: Vec<Vec<TextItemInfo>> = Vec::new();
+        for item in text_infos {
+            if let Some(last_cluster) = clusters.last_mut() {
+                // Check distance from the first item in the cluster (stable anchor)
+                if (item.baseline - last_cluster[0].baseline).abs() <= tolerance {
+                    last_cluster.push(item);
+                    continue;
+                }
+            }
+            clusters.push(vec![item]);
+        }
+
+        let cluster_count = clusters.len();
+        // Log if we emit lines
+        if out.len() < 5 {
+            console_log(format!(
+                "[LineFrame LOOSE] hint='{}' (0x{:02x}) -> {} lines (tolerance={:.2})",
+                if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
+                hint as u32,
+                cluster_count,
+                tolerance
+            ));
+        }
+
+        // Emit LineBoxes for each cluster
+        for (i, cluster) in clusters.into_iter().enumerate() {
+            let start_byte = cluster.iter().map(|i| i.start).min().unwrap();
+            let end_byte = cluster.iter().map(|i| i.end).max().unwrap();
+            let min_y = cluster.iter().map(|i| i.top).fold(f64::INFINITY, f64::min);
+            let max_y = cluster.iter().map(|i| i.bottom).fold(f64::NEG_INFINITY, f64::max);
+            // Use the first item's baseline as the cluster baseline
+            let baseline = cluster[0].baseline as f32;
+
+            let height = (max_y - min_y) as f32;
+            let top = min_y as f32;
+
+            if out.len() < 5 {
+                console_log(format!(
+                    "[LineBox #{}] Cluster {}/{} top={:.2}pt h={:.2}pt bytes={}..{}",
+                    out.len(),
+                    i + 1,
+                    cluster_count,
+                    top,
+                    height,
+                    start_byte,
+                    end_byte
+                ));
+            }
+
+            out.push(LineBox {
+                page,
+                top,
+                height,
+                baseline,
+                start_byte,
+                end_byte,
+            });
         }
     }
 
@@ -1234,45 +1560,28 @@ impl TypstCompileWorld {
         out
     }
 
-    /// Collect byte range from all text items in a frame (recursively).
-    #[cfg(feature = "incr")]
-    fn collect_byte_range_from_frame(
+    /// Test-only helper to collect glyph maps without constructing a full compiler instance.
+    #[cfg(all(test, feature = "incr"))]
+    pub(crate) fn collect_glyphs_from_frame_for_test(
         frame: &::typst::layout::Frame,
         source: &::typst::syntax::Source,
-        start_byte: &mut usize,
-        end_byte: &mut usize,
-    ) {
-        use ::typst::layout::FrameItem;
-
-        for (_pos, item) in frame.items() {
-            match item {
-                FrameItem::Text(text) => {
-                    for glyph in &text.glyphs {
-                        let span = glyph.span.0;
-                        if !span.is_detached() {
-                            if let Some(range) = source.range(span) {
-                                *start_byte = (*start_byte).min(range.start);
-                                *end_byte = (*end_byte).max(range.end);
-                            }
-                        }
-                    }
-                }
-                FrameItem::Group(group) => {
-                    Self::collect_byte_range_from_frame(&group.frame, source, start_byte, end_byte);
-                }
-                _ => {}
-            }
-        }
+    ) -> Vec<SpanGlyphMap> {
+        let mut result = Vec::new();
+        Self::collect_glyphs_from_frame(frame, source, &mut result);
+        result
     }
 
-    /// Collect the min/max Y bounds of all text glyphs under this frame (recursively),
-    /// applying the accumulated transform so we get absolute positions.
+    /// Collect text items from a frame (recursively) for geometric verification.
+    ///
+    /// Recurses into child groups (for styled text like bold/italic) but SKIPS
+    /// any groups whose frames have `content_hint` set (those are child line frames
+    /// that will be processed separately).
     #[cfg(feature = "incr")]
-    fn collect_text_bounds_from_frame(
+    fn collect_text_infos_from_frame(
         frame: &::typst::layout::Frame,
         transform: TransformState,
-        min_y: &mut f64,
-        max_y: &mut f64,
+        source: &::typst::syntax::Source,
+        out: &mut Vec<TextItemInfo>,
     ) {
         use ::typst::layout::FrameItem;
 
@@ -1281,8 +1590,11 @@ impl TypstCompileWorld {
 
             match item {
                 FrameItem::Text(text) => {
+                    // Text item pos.y is the baseline
+                    let (_, baseline) = child_transform.apply_to_point(0.0, 0.0);
+
+                    // Calculate bounds from bbox (ink bounds)
                     let bbox = text.bbox();
-                    // Use all four corners to respect potential skew transforms.
                     let corners = [
                         (bbox.min.x.to_pt(), bbox.min.y.to_pt()),
                         (bbox.min.x.to_pt(), bbox.max.y.to_pt()),
@@ -1290,15 +1602,43 @@ impl TypstCompileWorld {
                         (bbox.max.x.to_pt(), bbox.max.y.to_pt()),
                     ];
 
+                    let mut min_y = f64::INFINITY;
+                    let mut max_y = f64::NEG_INFINITY;
+
                     for (x, y) in corners {
                         let (_, ty) = child_transform.apply_to_point(x, y);
-                        *min_y = (*min_y).min(ty);
-                        *max_y = (*max_y).max(ty);
+                        min_y = min_y.min(ty);
+                        max_y = max_y.max(ty);
+                    }
+
+                    for glyph in &text.glyphs {
+                        let span = glyph.span.0;
+                        if !span.is_detached() {
+                            if let Some(range) = source.range(span) {
+                                out.push(TextItemInfo {
+                                    baseline,
+                                    top: min_y,
+                                    bottom: max_y,
+                                    start: range.start,
+                                    end: range.end,
+                                });
+                            }
+                        }
                     }
                 }
                 FrameItem::Group(group) => {
-                    let group_transform = child_transform.pre_concat(&group.transform);
-                    Self::collect_text_bounds_from_frame(&group.frame, group_transform, min_y, max_y);
+                    // Skip groups that are themselves line frames (have content_hint).
+                    // Those will be processed as their own line boxes.
+                    // Recurse into styling groups (no content_hint) to get styled text.
+                    if group.frame.content_hint() == '\0' {
+                        let group_transform = child_transform.pre_concat(&group.transform);
+                        Self::collect_text_infos_from_frame(
+                            &group.frame,
+                            group_transform,
+                            source,
+                            out,
+                        );
+                    }
                 }
                 _ => {}
             }

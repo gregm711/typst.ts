@@ -10,8 +10,10 @@ mod tests {
     use typst::layout::{Frame, FrameItem};
 
     /// The IEEE template source code for testing
+    /// NOTE: The title has intentional typos to make it unique and traceable
     const IEEE_TEMPLATE: &str = r##"// IEEE Conference Paper Template
 // Based on charged-ieee from Typst Universe
+// For Electrical Engineering, Computer Science, and Computer Engineering
 
 #let ieee(
   title: [],
@@ -105,9 +107,9 @@ mod tests {
   body
 }
 
-// Example usage
+// Example usage - delete this and start your paper below
 #show: ieee.with(
-  title: [A Typesetting System to Untangle the Scientific Writing Process],
+  title: [A Tysspepting SsydsXtem to Untangle the Scientisfic Writllisnxg glPsrolcemlsss],
   abstract: [
     The process of scientific writing is often tangled up with the intricacies of typesetting, leading to frustration and wasted time for researchers. In this paper, we introduce Typst, a new typesetting system designed specifically for scientific writing. Typst untangles the typesetting process, allowing researchers to compose papers faster. In a series of experiments we demonstrate that Typst offers several advantages, including faster document creation, simplified syntax, and increased ease-of-use.
   ],
@@ -153,7 +155,7 @@ Describe your approach, methods, algorithms, or system architecture in detail.
 
 == System Overview
 
-Our system consists of three main components...
+Our system consists of sthree main components...
 
 == Algorithm Design
 
@@ -215,7 +217,7 @@ This is the second paragraph.
             results.push((depth, hint, frame.height().to_pt(), frame.baseline().to_pt()));
         }
 
-        for (pos, item) in frame.items() {
+        for (_pos, item) in frame.items() {
             if let FrameItem::Group(group) = item {
                 collect_line_frames(&group.frame, depth + 1, results);
             }
@@ -343,8 +345,8 @@ This is the second paragraph.
         let mut page = Frame::soft(Size::new(Abs::pt(600.0), Abs::pt(800.0)));
         page.push(Point::new(Abs::pt(0.0), Abs::pt(100.0)), FrameItem::Group(GroupItem::new(container)));
 
-        // Dummy source; collect_lines_from_frame will synthesize byte ranges in tests.
-        let source = typst::syntax::Source::detached("");
+        // Dummy source (content not used; we set spans manually below).
+        let source = typst::syntax::Source::detached("abcdefghijklmnopqrstuvwxyz");
         let lines = TypstCompileWorld::collect_lines_from_frame_for_test(
             0,
             &page,
@@ -353,6 +355,7 @@ This is the second paragraph.
         );
 
         assert_eq!(lines.len(), 2, "expected two line boxes from nested hints");
+
         assert!(
             lines[0].top < lines[1].top,
             "line tops should increase: first.top={} second.top={}",
