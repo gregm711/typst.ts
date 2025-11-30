@@ -45,15 +45,50 @@ struct LineBox {
     end_byte: usize,
 }
 
-/// Intermediate text info for line box collection.
+/// Syntax node information for editor protection.
+/// Identifies structural elements (headings, lists, math, etc.) with their marker boundaries.
 #[cfg(feature = "incr")]
-struct TextInfo {
-    page: u32,
-    top: f32,
-    baseline: f32,
-    height: f32,
-    start_byte: usize,
-    end_byte: usize,
+#[derive(serde::Serialize)]
+struct SyntaxNodeInfo {
+    /// Syntax node kind: "Heading", "ListItem", "Equation", etc.
+    kind: String,
+    /// Full node byte range start
+    start: usize,
+    /// Full node byte range end
+    end: usize,
+    /// Opening marker byte range start (e.g., "=" for headings, "-" for lists, first "$" for math)
+    #[serde(rename = "markerStart", skip_serializing_if = "Option::is_none")]
+    marker_start: Option<usize>,
+    /// Opening marker byte range end
+    #[serde(rename = "markerEnd", skip_serializing_if = "Option::is_none")]
+    marker_end: Option<usize>,
+    /// Content byte range start (user content after opening marker)
+    #[serde(rename = "contentStart", skip_serializing_if = "Option::is_none")]
+    content_start: Option<usize>,
+    /// Content byte range end (before closing marker)
+    #[serde(rename = "contentEnd", skip_serializing_if = "Option::is_none")]
+    content_end: Option<usize>,
+    /// Closing marker byte range start (e.g., second "$" for math, second "*" for strong)
+    #[serde(rename = "closingMarkerStart", skip_serializing_if = "Option::is_none")]
+    closing_marker_start: Option<usize>,
+    /// Closing marker byte range end
+    #[serde(rename = "closingMarkerEnd", skip_serializing_if = "Option::is_none")]
+    closing_marker_end: Option<usize>,
+    /// Heading depth (number of = signs)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    depth: Option<usize>,
+}
+
+/// Result of marker boundary detection (internal helper)
+#[cfg(feature = "incr")]
+struct MarkerBoundaries {
+    marker_start: Option<usize>,
+    marker_end: Option<usize>,
+    content_start: Option<usize>,
+    content_end: Option<usize>,
+    closing_marker_start: Option<usize>,
+    closing_marker_end: Option<usize>,
+    depth: Option<usize>,
 }
 
 /// In format of
@@ -524,11 +559,16 @@ impl TypstCompileWorld {
         // Serialize line boxes for cursor height consistency
         let line_boxes_js = serde_wasm_bindgen::to_value(&line_boxes).unwrap_or(JsValue::NULL);
 
+        // Collect syntax nodes for editor protection (headings, lists, math, etc.)
+        let syntax_nodes = self.collect_syntax_nodes();
+        let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
+
         Ok(if diagnostics_format != 0 {
             let result = js_sys::Object::new();
             js_sys::Reflect::set(&result, &"result".into(), &v)?;
             js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
             js_sys::Reflect::set(&result, &"lineBoxes".into(), &line_boxes_js)?;
+            js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
             result.into()
         } else {
             // For backwards compatibility, just return delta if no diag format
@@ -583,9 +623,210 @@ impl TypstCompileWorld {
         }
     }
 
+    /// Collect syntax nodes for editor protection.
+    /// Identifies structural elements (headings, lists, math) with marker boundaries.
+    #[cfg(feature = "incr")]
+    fn collect_syntax_nodes(&self) -> Vec<SyntaxNodeInfo> {
+        use ::typst::World;
+
+        let mut result = Vec::new();
+        let world = &self.graph.snap.world;
+
+        let main_id = world.main();
+        if let Ok(source) = world.source(main_id) {
+            let root = source.root();
+            Self::collect_structural_nodes(root, &source, &mut result);
+        }
+
+        result
+    }
+
+    #[cfg(feature = "incr")]
+    fn collect_structural_nodes(
+        node: &::typst::syntax::SyntaxNode,
+        source: &::typst::syntax::Source,
+        result: &mut Vec<SyntaxNodeInfo>,
+    ) {
+        use ::typst::syntax::SyntaxKind;
+
+        let kind = node.kind();
+
+        // Only collect structural nodes that need protection
+        let dominated_content = matches!(
+            kind,
+            SyntaxKind::Heading
+                | SyntaxKind::ListItem
+                | SyntaxKind::EnumItem
+                | SyntaxKind::TermItem
+                | SyntaxKind::Equation
+                | SyntaxKind::Strong
+                | SyntaxKind::Emph
+                | SyntaxKind::Raw
+                | SyntaxKind::FuncCall
+        );
+
+        if dominated_content {
+            if let Some(range) = source.range(node.span()) {
+                let boundaries = Self::find_marker_boundaries(node, source);
+
+                result.push(SyntaxNodeInfo {
+                    kind: format!("{:?}", kind),
+                    start: range.start,
+                    end: range.end,
+                    marker_start: boundaries.marker_start,
+                    marker_end: boundaries.marker_end,
+                    content_start: boundaries.content_start,
+                    content_end: boundaries.content_end,
+                    closing_marker_start: boundaries.closing_marker_start,
+                    closing_marker_end: boundaries.closing_marker_end,
+                    depth: boundaries.depth,
+                });
+            }
+        }
+
+        // Always recurse to find nested structures
+        for child in node.children() {
+            Self::collect_structural_nodes(child, source, result);
+        }
+    }
+
+    #[cfg(feature = "incr")]
+    fn find_marker_boundaries(
+        node: &::typst::syntax::SyntaxNode,
+        source: &::typst::syntax::Source,
+    ) -> MarkerBoundaries {
+        use ::typst::syntax::SyntaxKind;
+
+        let mut result = MarkerBoundaries {
+            marker_start: None,
+            marker_end: None,
+            content_start: None,
+            content_end: None,
+            closing_marker_start: None,
+            closing_marker_end: None,
+            depth: None,
+        };
+
+        let node_kind = node.kind();
+
+        // Track whether we've seen the opening marker (for paired delimiters)
+        let mut seen_opening_marker = false;
+        // Track last content position for content_end
+        let mut last_content_end: Option<usize> = None;
+
+        for child in node.children() {
+            let child_kind = child.kind();
+            if let Some(range) = source.range(child.span()) {
+                match child_kind {
+                    // Heading marker: "=", "==", etc. (no closing marker)
+                    SyntaxKind::HeadingMarker => {
+                        result.marker_start = Some(range.start);
+                        result.marker_end = Some(range.end);
+                        result.depth = Some(range.end - range.start);
+                        seen_opening_marker = true;
+                    }
+                    // List/enum/term markers (no closing marker)
+                    SyntaxKind::ListMarker | SyntaxKind::EnumMarker | SyntaxKind::TermMarker => {
+                        result.marker_start = Some(range.start);
+                        result.marker_end = Some(range.end);
+                        seen_opening_marker = true;
+                    }
+                    // Math delimiters ($) - paired
+                    SyntaxKind::Dollar => {
+                        if !seen_opening_marker {
+                            result.marker_start = Some(range.start);
+                            result.marker_end = Some(range.end);
+                            seen_opening_marker = true;
+                        } else {
+                            // This is the closing $
+                            result.closing_marker_start = Some(range.start);
+                            result.closing_marker_end = Some(range.end);
+                            // Content ends where closing marker starts
+                            if result.content_end.is_none() {
+                                result.content_end = Some(range.start);
+                            }
+                        }
+                    }
+                    // Strong (*) markers - paired
+                    SyntaxKind::Star => {
+                        if node_kind == SyntaxKind::Strong {
+                            if !seen_opening_marker {
+                                result.marker_start = Some(range.start);
+                                result.marker_end = Some(range.end);
+                                seen_opening_marker = true;
+                            } else {
+                                result.closing_marker_start = Some(range.start);
+                                result.closing_marker_end = Some(range.end);
+                                if result.content_end.is_none() {
+                                    result.content_end = Some(range.start);
+                                }
+                            }
+                        }
+                    }
+                    // Emph (_) markers - paired
+                    SyntaxKind::Underscore => {
+                        if node_kind == SyntaxKind::Emph {
+                            if !seen_opening_marker {
+                                result.marker_start = Some(range.start);
+                                result.marker_end = Some(range.end);
+                                seen_opening_marker = true;
+                            } else {
+                                result.closing_marker_start = Some(range.start);
+                                result.closing_marker_end = Some(range.end);
+                                if result.content_end.is_none() {
+                                    result.content_end = Some(range.start);
+                                }
+                            }
+                        }
+                    }
+                    // Raw delimiters (`) - can be single or triple
+                    SyntaxKind::RawDelim => {
+                        if !seen_opening_marker {
+                            result.marker_start = Some(range.start);
+                            result.marker_end = Some(range.end);
+                            seen_opening_marker = true;
+                        } else {
+                            result.closing_marker_start = Some(range.start);
+                            result.closing_marker_end = Some(range.end);
+                            if result.content_end.is_none() {
+                                result.content_end = Some(range.start);
+                            }
+                        }
+                    }
+                    // FuncCall: identifier is the "marker", args are content
+                    SyntaxKind::Ident if node_kind == SyntaxKind::FuncCall => {
+                        if result.marker_start.is_none() {
+                            result.marker_start = Some(range.start);
+                            result.marker_end = Some(range.end);
+                            seen_opening_marker = true;
+                        }
+                    }
+                    // Skip whitespace for content tracking
+                    SyntaxKind::Space | SyntaxKind::Linebreak | SyntaxKind::Parbreak => {}
+                    // Track content region
+                    _ => {
+                        if seen_opening_marker {
+                            if result.content_start.is_none() {
+                                result.content_start = Some(range.start);
+                            }
+                            last_content_end = Some(range.end);
+                        }
+                    }
+                }
+            }
+        }
+
+        // For nodes without closing markers (headings, lists), content_end is the last content position
+        if result.closing_marker_start.is_none() && last_content_end.is_some() {
+            result.content_end = last_content_end;
+        }
+
+        result
+    }
+
     /// Collect line boxes from the laid-out document.
-    /// Groups text items by Y position to infer visual lines,
-    /// providing consistent cursor height for the editor.
+    /// Detects actual line frames using content_hint (set by inline layout),
+    /// rather than grouping text items by Y proximity.
     #[cfg(feature = "incr")]
     fn collect_line_boxes(&self, doc: &TypstPagedDocument) -> Vec<LineBox> {
         use ::typst::layout::Point as TypstPoint;
@@ -598,74 +839,26 @@ impl TypstCompileWorld {
             Err(_) => return Vec::new(),
         };
 
-        let mut text_infos: Vec<TextInfo> = Vec::new();
+        let mut lines: Vec<LineBox> = Vec::new();
 
         for (page_idx, page) in doc.pages.iter().enumerate() {
-            Self::collect_text_from_frame(
+            Self::collect_lines_from_frame(
                 page_idx as u32,
                 &page.frame,
                 TypstPoint::zero(),
                 &source,
-                &mut text_infos,
+                &mut lines,
             );
         }
 
-        if text_infos.is_empty() {
-            return Vec::new();
-        }
-
-        // Sort by page, then by Y position
-        text_infos.sort_by(|a, b| {
+        // Sort by page, then by Y position (top)
+        lines.sort_by(|a, b| {
             a.page.cmp(&b.page).then_with(|| {
                 a.top
                     .partial_cmp(&b.top)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
         });
-
-        // Group into lines by Y proximity (3pt tolerance)
-        const Y_TOLERANCE: f32 = 3.0;
-        let mut lines: Vec<LineBox> = Vec::new();
-        let mut current_line: Option<LineBox> = None;
-
-        for info in text_infos {
-            if let Some(ref mut line) = current_line {
-                // Check if same page and Y within tolerance
-                if line.page == info.page && (info.top - line.top).abs() < Y_TOLERANCE {
-                    // Extend current line
-                    line.height = line.height.max(info.height);
-                    line.baseline = line.baseline.max(info.baseline);
-                    line.start_byte = line.start_byte.min(info.start_byte);
-                    line.end_byte = line.end_byte.max(info.end_byte);
-                } else {
-                    // Start new line
-                    lines.push(current_line.take().unwrap());
-                    current_line = Some(LineBox {
-                        page: info.page,
-                        top: info.top,
-                        height: info.height,
-                        baseline: info.baseline,
-                        start_byte: info.start_byte,
-                        end_byte: info.end_byte,
-                    });
-                }
-            } else {
-                // First line
-                current_line = Some(LineBox {
-                    page: info.page,
-                    top: info.top,
-                    height: info.height,
-                    baseline: info.baseline,
-                    start_byte: info.start_byte,
-                    end_byte: info.end_byte,
-                });
-            }
-        }
-
-        // Don't forget the last line
-        if let Some(line) = current_line {
-            lines.push(line);
-        }
 
         // Ensure minimum line height (12pt)
         const MIN_LINE_HEIGHT: f32 = 12.0;
@@ -678,76 +871,91 @@ impl TypstCompileWorld {
         lines
     }
 
-    /// Recursively collect text items from a frame with their absolute positions.
-    /// Note: We accumulate offsets through recursion rather than applying full
-    /// transform matrices, as we only need Y positions for line box grouping.
+    /// Recursively collect line frames from the frame hierarchy.
+    /// Line frames are identified by having content_hint != '\0' (set by commit()).
+    /// This gives us actual line geometry from Typst's layout stage.
     #[cfg(feature = "incr")]
-    fn collect_text_from_frame(
+    fn collect_lines_from_frame(
         page: u32,
         frame: &::typst::layout::Frame,
         offset: ::typst::layout::Point,
         source: &::typst::syntax::Source,
-        out: &mut Vec<TextInfo>,
+        out: &mut Vec<LineBox>,
     ) {
         use ::typst::layout::{FrameItem, Point as TypstPoint};
 
+        // Check if this frame is a line frame (has content_hint set)
+        if frame.content_hint() != '\0' {
+            // This is a line frame - extract its geometry
+            let top = offset.y.to_pt() as f32;
+            let height = frame.height().to_pt() as f32;
+            let baseline = offset.y.to_pt() as f32 + frame.baseline().to_pt() as f32;
+
+            // Collect byte range from all text items in this line
+            let mut start_byte = usize::MAX;
+            let mut end_byte = 0usize;
+            Self::collect_byte_range_from_frame(frame, source, &mut start_byte, &mut end_byte);
+
+            if start_byte != usize::MAX && end_byte > 0 {
+                out.push(LineBox {
+                    page,
+                    top,
+                    height,
+                    baseline,
+                    start_byte,
+                    end_byte,
+                });
+            }
+            // Don't recurse into line frame's children - we've already extracted the line
+            return;
+        }
+
+        // Not a line frame - recurse into children
         for (pos, item) in frame.items() {
-            // Accumulate position offsets
             let abs_pos = TypstPoint::new(offset.x + pos.x, offset.y + pos.y);
 
+            if let FrameItem::Group(group) = item {
+                // Apply transform translation
+                let group_offset = TypstPoint::new(
+                    abs_pos.x + group.transform.tx,
+                    abs_pos.y + group.transform.ty,
+                );
+                Self::collect_lines_from_frame(
+                    page,
+                    &group.frame,
+                    group_offset,
+                    source,
+                    out,
+                );
+            }
+        }
+    }
+
+    /// Collect byte range from all text items in a frame (recursively).
+    #[cfg(feature = "incr")]
+    fn collect_byte_range_from_frame(
+        frame: &::typst::layout::Frame,
+        source: &::typst::syntax::Source,
+        start_byte: &mut usize,
+        end_byte: &mut usize,
+    ) {
+        use ::typst::layout::FrameItem;
+
+        for (_pos, item) in frame.items() {
             match item {
-                FrameItem::Group(group) => {
-                    // For groups with transforms, we apply the translation component
-                    // (transforms like rotation/scale are less common for text lines)
-                    let group_offset = TypstPoint::new(
-                        abs_pos.x + group.transform.tx,
-                        abs_pos.y + group.transform.ty,
-                    );
-                    Self::collect_text_from_frame(
-                        page,
-                        &group.frame,
-                        group_offset,
-                        source,
-                        out,
-                    );
-                }
                 FrameItem::Text(text) => {
-                    // Get text metrics using Em's .get() method (returns ratio of font size)
-                    // Then scale by font size to get actual length
-                    let font_metrics = text.font.metrics();
-                    let font_size = text.size.to_pt() as f32;
-                    let ascender = font_metrics.ascender.get() as f32 * font_size;
-                    let descender = font_metrics.descender.get() as f32 * font_size;
-                    let height = (ascender - descender).abs();
-
-                    // Y position is at the baseline; top = baseline - ascender
-                    let baseline = abs_pos.y.to_pt() as f32;
-                    let top = baseline - ascender;
-
-                    // Get byte range from spans
-                    let mut start_byte = usize::MAX;
-                    let mut end_byte = 0usize;
-
                     for glyph in &text.glyphs {
                         let span = glyph.span.0;
                         if !span.is_detached() {
                             if let Some(range) = source.range(span) {
-                                start_byte = start_byte.min(range.start);
-                                end_byte = end_byte.max(range.end);
+                                *start_byte = (*start_byte).min(range.start);
+                                *end_byte = (*end_byte).max(range.end);
                             }
                         }
                     }
-
-                    if start_byte != usize::MAX && end_byte > 0 {
-                        out.push(TextInfo {
-                            page,
-                            top,
-                            baseline,
-                            height,
-                            start_byte,
-                            end_byte,
-                        });
-                    }
+                }
+                FrameItem::Group(group) => {
+                    Self::collect_byte_range_from_frame(&group.frame, source, start_byte, end_byte);
                 }
                 _ => {}
             }
