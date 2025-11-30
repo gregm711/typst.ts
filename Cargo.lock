@@ -5600,6 +5600,7 @@ dependencies = [
  "serde-wasm-bindgen",
  "serde_json",
  "sha2",
+ "tiny-skia-path",
  "typst",
  "typst-assets",
  "typst-ts-test-common",

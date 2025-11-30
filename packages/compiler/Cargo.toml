@@ -49,6 +49,7 @@ typst-ts-test-common.workspace = true
 hex.workspace = true
 sha2.workspace = true
 web-sys = { workspace = true, features = ["console"] }
+tiny-skia-path.workspace = true
 
 [features]
 full = ["web", "web_test", "fonts", "misc"]
