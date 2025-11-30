@@ -147,13 +147,15 @@ export class RenderSession {
     const pages_info = this[kObject].pages_info;
     const pageInfos: PageInfo[] = [];
     const pageCount = pages_info.page_count;
+    let cumulativeOffset = 0;
     for (let i = 0; i < pageCount; i++) {
       const pageAst = pages_info.page(i);
       pageInfos.push({
-        pageOffset: pageAst.page_off,
+        pageOffset: cumulativeOffset,
         width: pageAst.width_pt,
         height: pageAst.height_pt,
       });
+      cumulativeOffset += pageAst.height_pt;
     }
 
     return pageInfos;
@@ -340,13 +342,15 @@ export class TypstWorker {
     console.log(pages_info);
     const pageInfos: PageInfo[] = [];
     const pageCount = pages_info.page_count;
+    let cumulativeOffset = 0;
     for (let i = 0; i < pageCount; i++) {
       const pageAst = pages_info.page(i);
       pageInfos.push({
-        pageOffset: pageAst.page_off,
+        pageOffset: cumulativeOffset,
         width: pageAst.width_pt,
         height: pageAst.height_pt,
       });
+      cumulativeOffset += pageAst.height_pt;
     }
 
     return pageInfos;
