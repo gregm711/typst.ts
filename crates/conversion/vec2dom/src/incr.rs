@@ -108,10 +108,10 @@ impl IncrDomDocClient {
         let page = &mut self.doc_view[page_num as usize];
 
         match stage {
-            STAGE_LAYOUT => Ok({
-                page.relayout(&self.canvas_backend)?;
-                false
-            }),
+            STAGE_LAYOUT => {
+                // Returns whether layout work was actually performed
+                page.relayout(&self.canvas_backend)
+            }
             STAGE_SVG => Ok(page.need_repaint_svg(viewport)),
             STAGE_SEMANTICS => Ok(page.need_repaint_semantics()),
             STAGE_PREPARE_CANVAS => {
@@ -153,6 +153,9 @@ impl IncrDomDocClient {
         let page = &mut self.doc_view[page_num as usize];
 
         match stage {
+            STAGE_LAYOUT => {
+                // Layout work is done in need_repaint; repaint is a no-op for this stage
+            }
             STAGE_SVG => {
                 page.repaint_svg(&mut ctx)?;
             }

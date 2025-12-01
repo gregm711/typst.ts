@@ -129,6 +129,8 @@ impl DomPage {
         }
 
         self.dirty_layout = Some(data.clone());
+        // Clear realized state to ensure re-render even if relayout is skipped
+        *self.realized.lock().unwrap() = None;
         true
     }
 
@@ -178,12 +180,14 @@ impl DomPage {
         }
     }
 
-    pub fn relayout(&mut self, ctx: &CanvasBackend) -> Result<()> {
+    /// Returns true if layout work was performed (dirty_layout was present)
+    pub fn relayout(&mut self, ctx: &CanvasBackend) -> Result<bool> {
         if let Some(data) = self.dirty_layout.take() {
-            self.do_relayout(ctx, data)?
+            self.do_relayout(ctx, data)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-
-        Ok(())
     }
 
     fn do_relayout(&mut self, ctx: &CanvasBackend, data: Page) -> Result<()> {
@@ -270,11 +274,15 @@ impl DomPage {
         self.pull_viewport(viewport);
 
         let should_visible = !self.bbox.intersect(&self.viewport).is_empty();
+        // Check if we actually need to do rendering work:
+        // - dirty_layout means data changed and needs processing
+        // - realized.is_none() means SVG elements need to be created
+        let needs_render = self.dirty_layout.is_some() || self.realized.lock().unwrap().is_none();
 
         if cfg!(feature = "debug_repaint_svg") {
             web_sys::console::log_1(
                 &format!(
-                    "need_repaint_svg({should_visible}) bbox:{bbox:?} view:{viewport:?}",
+                    "need_repaint_svg(visible:{should_visible}, needs_render:{needs_render}) bbox:{bbox:?} view:{viewport:?}",
                     bbox = self.bbox,
                     viewport = self.viewport,
                 )
@@ -283,7 +291,8 @@ impl DomPage {
         }
 
         self.change_svg_visibility(should_visible);
-        should_visible
+        // Only repaint if visible AND there's actual work to do
+        should_visible && needs_render
     }
 
     pub fn repaint_svg(&mut self, ctx: &mut DomContext<'_, '_>) -> Result<()> {
