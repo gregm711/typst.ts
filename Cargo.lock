@@ -5476,6 +5476,7 @@ dependencies = [
  "anyhow",
  "comemo",
  "hex",
+ "reflexo",
  "reflexo-typst",
  "reflexo-typst2vec",
  "reflexo-vec2svg",

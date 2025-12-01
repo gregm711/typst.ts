@@ -18,6 +18,7 @@ reflexo-typst2vec.workspace = true
 typst-ts-dev-server.workspace = true
 typst-ts-test-common.workspace = true
 reflexo-typst.workspace = true
+reflexo.workspace = true
 hex.workspace = true
 reflexo-vec2svg.workspace = true
 

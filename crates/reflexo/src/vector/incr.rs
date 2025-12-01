@@ -11,6 +11,8 @@ pub struct IncrDocClient {
     pub doc: MultiVecDocument,
     /// Hold glyphs.
     pub glyphs: Vec<(GlyphRef, FlatGlyphItem)>,
+    /// Monotonic version of the currently applied layout.
+    pub layout_version: u64,
 
     /// checkout of the current document.
     pub layout: Option<LayoutRegionNode>,
@@ -23,6 +25,8 @@ pub struct IncrDocClient {
 impl IncrDocClient {
     /// Merge the delta from server.
     pub fn merge_delta(&mut self, delta: FlatModule) {
+        // Each merged delta represents a new layout version.
+        self.layout_version = self.layout_version.wrapping_add(1);
         self.doc.merge_delta(&delta);
         for metadata in delta.metadata {
             match metadata {

@@ -101,3 +101,121 @@ pub fn main() {
         test_compiler(&workspace_dir, &entry_file_path);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reflexo::hash::Fingerprint;
+    use reflexo_typst2vec::stream::BytesModuleStream;
+    use std::path::Path;
+
+    /// Compile source through the incremental server/client pipeline and return page fingerprints.
+    fn page_fingerprints(
+        server: &mut IncrDocServer,
+        client: &mut IncrDocClient,
+        driver: &TypstSystemUniverse,
+        source: &str,
+    ) -> Vec<Fingerprint> {
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc));
+        let delta = BytesModuleStream::from_slice(&delta).checkout_owned();
+        client.merge_delta(delta);
+        client.set_layout(client.doc.layouts[0].unwrap_single());
+
+        let layout = client.layout.as_ref().expect("layout present after merge");
+        let pages = layout
+            .pages(client.module())
+            .expect("page view available after layout");
+
+        pages.pages().iter().map(|p| p.content).collect()
+    }
+
+    fn make_driver() -> TypstSystemUniverse {
+        let project_base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let workspace_dir = project_base.clone();
+        let entry_file_path = project_base.join("fuzzers/corpora/typst-templates/ieee/main.typ");
+        get_driver(&workspace_dir, &entry_file_path)
+    }
+
+    fn base_and_edited() -> (&'static str, &'static str) {
+        let base_src = r#"
+#set page(width: 340pt, height: 140pt)
+#set text(12pt)
+
+= Incremental Fingerprint Test
+Page one base content.
+#pagebreak()
+Page two base content.
+#pagebreak()
+Page three base content.
+#pagebreak()
+Page four base content.
+"#;
+
+        let edited_src = r#"
+#set page(width: 340pt, height: 140pt)
+#set text(12pt)
+
+= Incremental Fingerprint Test (edited)
+Page one edited content with an extra sentence.
+#pagebreak()
+Page two base content.
+#pagebreak()
+Page three base content.
+#pagebreak()
+Page four base content.
+"#;
+
+        (base_src, edited_src)
+    }
+
+    #[test]
+    fn layout_version_bumps_even_if_page_fingerprints_stable() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+        let mut client = IncrDocClient::default();
+        let (base_src, edited_src) = base_and_edited();
+
+        let initial_version = client.layout_version;
+        let before = page_fingerprints(&mut server, &mut client, &driver, base_src);
+        let mid_version = client.layout_version;
+        assert!(
+            before.len() >= 2,
+            "expected multi-page doc from base content, got {} page(s)",
+            before.len()
+        );
+
+        let after = page_fingerprints(&mut server, &mut client, &driver, edited_src);
+        let final_version = client.layout_version;
+        assert_eq!(
+            before.len(),
+            after.len(),
+            "page count changed after small edit; adjust fixture to keep counts stable"
+        );
+
+        // Layout version should bump on each merge, even if fingerprints are identical.
+        assert!(
+            mid_version > initial_version && final_version > mid_version,
+            "layout_version did not increment across merges (initial={}, mid={}, final={})",
+            initial_version,
+            mid_version,
+            final_version
+        );
+
+        let fingerprints_changed = before
+            .iter()
+            .zip(after.iter())
+            .any(|(a, b)| a != b);
+
+        assert!(
+            fingerprints_changed || final_version != mid_version,
+            "Page fingerprints stayed identical and layout_version did not bump; renderer would skip repaint"
+        );
+    }
+
+}
