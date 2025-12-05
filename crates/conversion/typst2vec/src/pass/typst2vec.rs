@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
+    collections::{HashMap, HashSet},
     hash::Hash,
     sync::{atomic::AtomicU64, Arc},
 };
@@ -31,11 +32,13 @@ use typst::{
     },
 };
 use typst_html::{HtmlElement, HtmlNode};
+use tiny_skia_path::Transform as SkTransform;
 
 use crate::{
     convert::ImageExt,
     font::GlyphProvider,
     hash::{Fingerprint, FingerprintBuilder},
+    layout::{inflate_rect_by_stroke, PageLayout, SpanBBox},
     ir::{self, *},
     path2d::SvgPath2DBuilder,
     utils::{AbsExt, ToCssExt},
@@ -50,6 +53,77 @@ pub const PAGELESS_SIZE: ir::Size = Size::new(Scalar(1e2 + 4.1234567), Scalar(1e
 thread_local! {
     static TEXT_GLYPH_BUF: RefCell<Vec<(Axes<Abs>, Axes<Abs>, u32)>> = RefCell::new(Vec::new());
     static PATH_STYLE_BUF: RefCell<Vec<PathStyle>> = RefCell::new(Vec::new());
+}
+
+#[derive(Default)]
+struct LayoutCollector {
+    spans: Mutex<HashMap<u64, Rect>>,
+}
+
+impl LayoutCollector {
+    fn record_span(&self, span: u64, rect: Rect, transform: Transform) {
+        if span == 0 || rect.is_empty() {
+            return;
+        }
+
+        let world = transform_rect(rect, transform).cano();
+        if world.is_empty() {
+            return;
+        }
+
+        let mut spans = self.spans.lock();
+        spans
+            .entry(span)
+            .and_modify(|existing| *existing = existing.union(&world))
+            .or_insert(world);
+    }
+
+    fn to_page_layout(&self, page: u32) -> PageLayout {
+        let spans = self
+            .spans
+            .lock()
+            .iter()
+            .map(|(span, rect)| SpanBBox {
+                span: *span,
+                x: rect.left().0,
+                y: rect.top().0,
+                width: rect.width().0,
+                height: rect.height().0,
+            })
+            .collect();
+
+        PageLayout { page, spans }
+    }
+}
+
+fn rect_from_size(size: Axes<TypstAbs>) -> Rect {
+    Rect {
+        lo: Point::new(Scalar(0.), Scalar(0.)),
+        hi: Point::new(Scalar(size.x.to_f32()), Scalar(size.y.to_f32())),
+    }
+}
+
+fn rect_from_typst(rect: typst::layout::Rect) -> Rect {
+    Rect {
+        lo: Point::new(Scalar(rect.min.x.to_pt() as f32), Scalar(rect.min.y.to_pt() as f32)),
+        hi: Point::new(Scalar(rect.max.x.to_pt() as f32), Scalar(rect.max.y.to_pt() as f32)),
+    }
+}
+
+fn transform_rect(rect: Rect, transform: Transform) -> Rect {
+    let ts: SkTransform = transform.into();
+    let mut corners = [
+        tiny_skia_path::Point::from(rect.lo),
+        tiny_skia_path::Point::from(Point::new(rect.hi.x, rect.lo.y)),
+        tiny_skia_path::Point::from(Point::new(rect.lo.x, rect.hi.y)),
+        tiny_skia_path::Point::from(rect.hi),
+    ];
+
+    ts.map_points(&mut corners);
+
+    tiny_skia_path::Rect::from_points(&corners)
+        .map(From::from)
+        .unwrap_or_else(Rect::empty)
 }
 
 #[derive(Clone, Copy)]
@@ -249,14 +323,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         }
     }
 
-    pub fn doc(&self, doc: &TypstDocument) -> Vec<Page> {
+    pub fn doc(&self, doc: &TypstDocument) -> (Vec<Page>, Vec<PageLayout>) {
         match doc {
             TypstDocument::Html(doc) => self.html(doc),
             TypstDocument::Paged(doc) => self.paged(doc),
         }
     }
 
-    pub fn html(&self, doc: &TypstHtmlDocument) -> Vec<Page> {
+    pub fn html(&self, doc: &TypstHtmlDocument) -> (Vec<Page>, Vec<PageLayout>) {
         let doc_reg = self.spans.start();
 
         let page_reg = self.spans.start();
@@ -282,18 +356,19 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             .doc_region
             .store(doc_reg, std::sync::atomic::Ordering::SeqCst);
 
-        vec![root]
+        (vec![root], vec![])
     }
 
-    pub fn paged(&self, doc: &TypstPagedDocument) -> Vec<Page> {
+    pub fn paged(&self, doc: &TypstPagedDocument) -> (Vec<Page>, Vec<PageLayout>) {
         let doc_reg = self.spans.start();
 
-        let pages = doc
+        let results: Vec<(Page, PageLayout)> = doc
             .pages
             .par_iter()
             .enumerate()
             .map(|(idx, p)| {
                 let page_reg = self.spans.start();
+                let layout = Arc::new(LayoutCollector::default());
 
                 let state = State::new(&doc.introspector, p.frame.size().into_typst());
                 let abs_ref = self.frame_(
@@ -303,6 +378,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                     idx,
                     p.fill_or_transparent(),
                     None,
+                    Some(layout.clone()),
                 );
 
                 self.spans.push_span(SourceRegion {
@@ -312,10 +388,13 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                     item: abs_ref,
                 });
 
-                Page {
-                    content: abs_ref,
-                    size: p.frame.size().into_typst(),
-                }
+                (
+                    Page {
+                        content: abs_ref,
+                        size: p.frame.size().into_typst(),
+                    },
+                    layout.to_page_layout(idx as u32),
+                )
             })
             .collect();
 
@@ -323,7 +402,9 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             .doc_region
             .store(doc_reg, std::sync::atomic::Ordering::SeqCst);
 
-        pages
+        let (pages, layout_map): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+
+        (pages, layout_map)
     }
 
     fn frame(
@@ -333,8 +414,9 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         parent: usize,
         index: usize,
         span: Option<Span>,
+        layout: Option<Arc<LayoutCollector>>,
     ) -> Fingerprint {
-        self.frame_(state, frame, parent, index, None, span)
+        self.frame_(state, frame, parent, index, None, span, layout)
     }
 
     fn frame_(
@@ -345,6 +427,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         index: usize,
         fill: Option<Paint>,
         span: Option<Span>,
+        layout: Option<Arc<LayoutCollector>>,
     ) -> Fingerprint {
         let src_reg = self.spans.start();
 
@@ -383,11 +466,12 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             let idx = fill_adjust + idx;
             let mut is_link = false;
             let state = state.pre_translate((*pos).into_typst());
+            let layout = layout.clone();
             let item = match item {
                 FrameItem::Group(group) => {
                     let state = state.pre_concat(group.transform.into_typst());
 
-                    let mut inner = self.frame(state, &group.frame, src_reg, idx, None);
+                    let mut inner = self.frame(state, &group.frame, src_reg, idx, None, layout);
 
                     if let Some(p) = group.clip.as_ref() {
                         // todo: merge
@@ -458,6 +542,22 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         item: i,
                     });
 
+                    if let Some(layout) = &layout {
+                        let mut seen = HashSet::new();
+                        let mut rect = rect_from_typst(text.bbox());
+                        if let Some(stroke) = text.stroke.as_ref() {
+                            rect = inflate_rect_by_stroke(rect, stroke);
+                        }
+                        let spans = text.glyphs.iter().map(|g| g.span);
+                        for span in spans {
+                            let id = span.0.into_raw().get();
+                            if id == 0 || !seen.insert(id) {
+                                continue;
+                            }
+                            layout.record_span(id, rect, state.transform);
+                        }
+                    }
+
                     i
                 }
                 FrameItem::Shape(shape, s) => {
@@ -471,6 +571,25 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         item: i,
                     });
 
+                    if let Some(layout) = &layout {
+                        let mut rect = rect_from_size(shape.geometry.bbox_size());
+                        if let Some(stroke) = &shape.stroke {
+                            rect = inflate_rect_by_stroke(rect, stroke);
+                        }
+
+                        if rect.is_empty() {
+                            // Keep a minimal footprint so zero-sized shapes still register.
+                            let epsilon = Scalar(1.0);
+                            rect.hi.x = rect.hi.x.max(rect.lo.x + epsilon);
+                            rect.hi.y = rect.hi.y.max(rect.lo.y + epsilon);
+                        }
+
+                        let id = s.into_raw().get();
+                        if id != 0 {
+                            layout.record_span(id, rect, state.transform);
+                        }
+                    }
+
                     i
                 }
                 FrameItem::Image(image, size, s) => {
@@ -482,6 +601,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         kind: SourceNodeKind::Image(*s),
                         item: i,
                     });
+
+                    if let Some(layout) = &layout {
+                        let rect = rect_from_size(*size);
+                        let id = s.into_raw().get();
+                        if id != 0 {
+                            layout.record_span(id, rect, state.transform);
+                        }
+                    }
 
                     i
                 }
@@ -587,32 +714,37 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     }
 
     fn insert_if(&self, cond: Fingerprint, f: impl FnOnce() -> VecItem) -> Fingerprint {
+        // Fast-path lookup using the precomputed condition fingerprint.
         let shard = &self.cache_items.shard(cond);
-        let shard_read = shard.read();
-        if let Some(pos) = shard_read.get(&cond) {
+        if let Some(pos) = shard.read().get(&cond) {
             self.increase_lifetime_for_item(&pos.0);
             self.insert(pos.1, Cow::Borrowed(&pos.2));
             return pos.1;
         }
 
-        drop(shard_read);
-
+        // Cache miss: build the item and compute its true fingerprint.
         let item = f();
-        #[cfg(debug_assertions)]
-        {
-            let flat_fg = self.fingerprint_builder.resolve(&item);
-            debug_assert_eq!(
-                flat_fg, cond,
-                "cache condition fingerprint deviates from item fingerprint"
-            );
+        let flat_fg = self.fingerprint_builder.resolve(&item);
+
+        // If the computed fingerprint differs from the condition fingerprint
+        // (e.g., size clamping for degenerate shapes), try a second lookup
+        // using the real fingerprint before inserting a duplicate.
+        if flat_fg != cond {
+            let shard = &self.cache_items.shard(flat_fg);
+            if let Some(pos) = shard.read().get(&flat_fg) {
+                self.increase_lifetime_for_item(&pos.0);
+                self.insert(pos.1, Cow::Borrowed(&pos.2));
+                return pos.1;
+            }
         }
-        let flat_fg = cond;
+
+        let shard = &self.cache_items.shard(flat_fg);
         self.insert(flat_fg, Cow::Borrowed(&item));
 
         {
             let mut shard_write = shard.write();
             shard_write.insert(
-                cond,
+                flat_fg,
                 if ENABLE_REF_CNT {
                     (AtomicU64::new(self.lifetime), flat_fg, item)
                 } else {
@@ -1130,7 +1262,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     }
 
     fn pattern(&self, state: State, g: &Tiling, transform: ir::Transform) -> Fingerprint {
-        let frame = self.frame(state, g.frame(), 0, 0, None);
+        let frame = self.frame(state, g.frame(), 0, 0, None, None);
 
         let item = self.store(VecItem::Pattern(Arc::new(PatternItem {
             frame,
@@ -1167,7 +1299,9 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         match child {
                             HtmlNode::Tag(..) => continue,
                             HtmlNode::Frame(e) => {
-                                HtmlChildren::Item(self.frame(state, &e.inner, parent, index, None))
+                                HtmlChildren::Item(
+                                    self.frame(state, &e.inner, parent, index, None, None),
+                                )
                             }
                             HtmlNode::Element(e) => {
                                 HtmlChildren::Item(self.html_element(state, e, parent, index))

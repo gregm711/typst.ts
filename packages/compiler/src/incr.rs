@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use reflexo_typst::{TypstDocument, TypstPagedDocument};
-use reflexo_typst2vec::incr::IncrDocServer;
+use reflexo_typst2vec::incr::{IncrDocServer, PackedDelta};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -22,7 +22,7 @@ impl Default for IncrServer {
 }
 
 impl IncrServer {
-    pub(crate) fn update(&mut self, doc: Arc<TypstPagedDocument>) -> Vec<u8> {
+    pub(crate) fn update(&mut self, doc: Arc<TypstPagedDocument>) -> PackedDelta {
         // evicted by compiler
         // comemo::evict(30);
 

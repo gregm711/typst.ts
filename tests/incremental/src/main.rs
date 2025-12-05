@@ -48,7 +48,7 @@ pub fn test_compiler(workspace_dir: &Path, entry_file_path: &Path) {
         .output
         .unwrap();
     let server_delta = incr_server.pack_delta(&TypstDocument::Paged(doc));
-    let server_delta = BytesModuleStream::from_slice(&server_delta).checkout_owned();
+    let server_delta = BytesModuleStream::from_slice(&server_delta.bytes).checkout_owned();
     incr_client.merge_delta(server_delta);
     let _ = incr_svg_client.render_in_window(&mut incr_client, window);
 
@@ -65,8 +65,8 @@ pub fn test_compiler(workspace_dir: &Path, entry_file_path: &Path) {
             .unwrap();
 
         let server_delta = incr_server.pack_delta(&TypstDocument::Paged(doc));
-        let sd = server_delta.len();
-        let server_delta = BytesModuleStream::from_slice(&server_delta).checkout_owned();
+        let sd = server_delta.bytes.len();
+        let server_delta = BytesModuleStream::from_slice(&server_delta.bytes).checkout_owned();
         incr_client.merge_delta(server_delta);
         incr_client.set_layout(incr_client.doc.layouts[0].unwrap_single());
         let cd = incr_svg_client.render_in_window(&mut incr_client, window);
@@ -123,7 +123,7 @@ mod tests {
             .expect("compile document");
 
         let delta = server.pack_delta(&TypstDocument::Paged(doc));
-        let delta = BytesModuleStream::from_slice(&delta).checkout_owned();
+        let delta = BytesModuleStream::from_slice(&delta.bytes).checkout_owned();
         client.merge_delta(delta);
         client.set_layout(client.doc.layouts[0].unwrap_single());
 
@@ -215,6 +215,58 @@ Page four base content.
         assert!(
             fingerprints_changed || final_version != mid_version,
             "Page fingerprints stayed identical and layout_version did not bump; renderer would skip repaint"
+        );
+    }
+
+    #[test]
+    fn layout_map_captures_stroked_and_zero_sized_shapes() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+
+        // Two shapes: a stroked rect with known dimensions, and a zero-sized box with stroke.
+        let source = r#"
+#set page(width: 200pt, height: 200pt, margin: 0pt)
+#rect(width: 40pt, height: 10pt, stroke: 2pt)
+#box(width: 0pt, height: 0pt, stroke: 1pt)
+"#;
+
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc));
+        let layout_map = delta.layout_map;
+
+        assert_eq!(
+            layout_map.len(),
+            1,
+            "expected single-page layout map for the test document"
+        );
+
+        let spans = &layout_map[0].spans;
+        assert!(
+            !spans.is_empty(),
+            "layout map should contain at least the two placed shapes"
+        );
+
+        // The stroked rect should produce a bbox at least as large as its intrinsic size.
+        let has_stroked_rect = spans
+            .iter()
+            .any(|bbox| bbox.width >= 40.0 && bbox.height >= 10.0);
+        assert!(
+            has_stroked_rect,
+            "expected a bbox covering the stroked rect (>=40x10pt)"
+        );
+
+        // The zero-sized box still carries stroke; bbox should be >0 but not huge.
+        let has_zero_sized = spans.iter().any(|bbox| {
+            bbox.width > 0.0 && bbox.width <= 6.0 && bbox.height > 0.0 && bbox.height <= 6.0
+        });
+        assert!(
+            has_zero_sized,
+            "expected a bbox for the zero-sized stroked box (tiny but non-zero)"
         );
     }
 

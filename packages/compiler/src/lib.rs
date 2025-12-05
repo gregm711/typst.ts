@@ -699,11 +699,11 @@ impl TypstCompileWorld {
         // Collect glyph maps for accurate click-to-cursor positioning
         let glyph_maps = self.collect_glyph_maps(&doc);
 
-        let delta_bytes = state.update(doc);
-        let v = Uint8Array::from(delta_bytes.as_slice()).into();
+        let delta = state.update(doc);
+        let v = Uint8Array::from(delta.bytes.as_slice()).into();
 
         // Resolve span ranges from the world for source mapping
-        let span_ranges = self.resolve_span_ranges(&delta_bytes);
+        let span_ranges = self.resolve_span_ranges(&delta.bytes);
         let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
 
         // Serialize line boxes for cursor height consistency
@@ -729,6 +729,9 @@ impl TypstCompileWorld {
         let syntax_nodes = self.collect_syntax_nodes();
         let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
 
+        let layout_map_js =
+            serde_wasm_bindgen::to_value(&delta.layout_map).unwrap_or(JsValue::NULL);
+
         Ok(if diagnostics_format != 0 {
             console_log(format!("[incr_compile] Building result object with diagnostics_format={}", diagnostics_format));
             let result = js_sys::Object::new();
@@ -737,6 +740,7 @@ impl TypstCompileWorld {
             js_sys::Reflect::set(&result, &"lineBoxes".into(), &line_boxes_js)?;
             js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
             js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
+            js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
             console_log(format!("[incr_compile] Result object created, glyphMaps set (value is_null={})", glyph_maps_js.is_null()));
             result.into()
         } else {

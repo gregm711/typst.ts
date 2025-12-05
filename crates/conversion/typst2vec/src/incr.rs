@@ -3,11 +3,18 @@ use reflexo::typst::TypstDocument;
 use reflexo::vector::ir::{ModuleMetadata, Page};
 
 use super::ir::FlatModule;
+use super::layout::PageLayout;
 use super::pass::IncrTypst2VecPass;
 use crate::debug_loc::{ElementPoint, SourceSpanOffset};
 
 /// Client side implementation is free from typst details.
 pub use reflexo::vector::incr::{IncrDocClient, IncrDocClientKern};
+
+/// Binary delta plus accompanying per-span layout map.
+pub struct PackedDelta {
+    pub bytes: Vec<u8>,
+    pub layout_map: Vec<PageLayout>,
+}
 
 /// maintains the data of the incremental rendering at server side
 #[derive(Default)]
@@ -55,7 +62,7 @@ impl IncrDocServer {
     }
 
     /// Pack the delta into a binary blob.
-    pub fn pack_delta(&mut self, output: &TypstDocument) -> Vec<u8> {
+    pub fn pack_delta(&mut self, output: &TypstDocument) -> PackedDelta {
         self.typst2vec.spans.reset();
 
         // Increment the lifetime of all items to touch.
@@ -75,7 +82,7 @@ impl IncrDocServer {
         };
 
         // run typst2vec pass
-        let pages = self.typst2vec.doc(output);
+        let (pages, layout_map) = self.typst2vec.doc(output);
         self.pages = Some(pages.clone());
 
         // let new_items = builder.new_items.get_mut().len();
@@ -122,7 +129,10 @@ impl IncrDocServer {
         let delta = m.to_bytes();
 
         // log::info!("svg render time (incremental bin): {:?}", instant.elapsed());
-        [b"diff-v1,", delta.as_slice()].concat()
+        PackedDelta {
+            bytes: [b"diff-v1,", delta.as_slice()].concat(),
+            layout_map,
+        }
     }
 
     /// Pack the current entirely into a binary blob.

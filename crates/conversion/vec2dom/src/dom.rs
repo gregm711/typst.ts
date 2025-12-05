@@ -77,6 +77,8 @@ impl DomPage {
 
         let me = tmpl.create_element(TEMPLATE);
         me.set_attribute("data-index", &idx.to_string()).unwrap();
+        // data-page is used by frontend hit-testing to locate page-local layout map entries.
+        let _ = me.set_attribute("data-page", &idx.to_string());
         let canvas: HtmlCanvasElement = me.first_element_child().unwrap().dyn_into().unwrap();
         let svg: SvgsvgElement = canvas.next_element_sibling().unwrap().dyn_into().unwrap();
         let semantics: HtmlDivElement = svg.next_element_sibling().unwrap().dyn_into().unwrap();
