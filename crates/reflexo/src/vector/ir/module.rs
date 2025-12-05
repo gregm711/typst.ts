@@ -7,17 +7,18 @@ use std::{
 };
 
 use comemo::Prehashed;
+use fxhash::FxBuildHasher;
 
-use crate::{hash::Fingerprint, ImmutStr, TakeAs};
+use crate::{hash::Fingerprint, vector::map::FingerprintMap, ImmutStr, TakeAs};
 
 use super::{preludes::*, *};
 
 pub type ItemMap = BTreeMap<Fingerprint, VecItem>;
 
-pub type RefItemMap = HashMap<Fingerprint, (u64, VecItem)>;
+pub type RefItemMap = HashMap<Fingerprint, (u64, VecItem), FxBuildHasher>;
 #[cfg(feature = "item-dashmap")]
 pub type RefItemMapSync = crate::adt::CHashMap<Fingerprint, (AtomicU64, VecItem)>;
-pub type RefItemMapT<V> = crate::adt::FingerprintMap<V>;
+pub type RefItemMapT<V> = FingerprintMap<V>;
 pub type RefItemMapSync = RefItemMapT<(AtomicU64, VecItem)>;
 
 pub trait ToItemMap {

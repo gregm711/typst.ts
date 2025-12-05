@@ -7,6 +7,7 @@ pub mod vector {
     #[cfg(feature = "rkyv")]
     pub mod incr;
     pub mod ir;
+    pub mod map;
     #[cfg(feature = "rkyv")]
     pub mod stream;
     pub mod vm;

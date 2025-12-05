@@ -10,6 +10,7 @@ use reflexo_typst2vec::incr::IncrDocClient;
 use reflexo_vec2canvas::IncrCanvasDocClient;
 #[cfg(feature = "rkyv")]
 use rkyv::{Archive, Deserialize, Serialize};
+use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -235,8 +236,11 @@ impl RenderSession {
         self.client().kern().source_span(path)
     }
 
-    pub fn source_loc_from_span(&self, span_hex: String) -> Option<String> {
-        let raw = u64::from_str_radix(&span_hex, 16).ok()?;
+    fn resolve_span_loc(
+        &self,
+        span_hex: &str,
+    ) -> Option<(String, Option<usize>, Option<usize>, Option<u64>, bool)> {
+        let raw = u64::from_str_radix(span_hex, 16).ok()?;
 
         // Mirror typst::syntax::Span layout:
         const NUMBER_BITS: u64 = 48;
@@ -249,11 +253,6 @@ impl RenderSession {
         let file_id = raw >> NUMBER_BITS;
         let number = raw & NUMBER_MASK;
 
-        let mut payload = String::new();
-        use std::fmt::Write as _;
-
-        // Encode a human-ish payload the worker can forward.
-        // Assume single-file main.typ unless we ship a file table.
         let filepath = {
             let map = self.file_map.lock().unwrap();
             map.get(&(file_id as u32)).cloned().unwrap_or_else(|| {
@@ -265,49 +264,82 @@ impl RenderSession {
             })
         };
 
-        if let Some((f_id, start, end)) = self.span_map.lock().unwrap().get(&raw) {
-            write!(
-                &mut payload,
-                "{{\"span\":\"{}\",\"fileId\":{},\"filepath\":\"{}\",\"start\":{},\"end\":{},\"is_range\":true}}",
-                span_hex, f_id, filepath, start, end
-            )
-            .ok()?;
-            return Some(payload);
+        if let Some((_, start, end)) = self.span_map.lock().unwrap().get(&raw) {
+            return Some((filepath, Some(*start), Some(*end), None, false));
         }
 
         if number < 2 {
-            // Detached span.
-            write!(
-                &mut payload,
-                "{{\"span\":\"{}\",\"detached\":true,\"fileId\":{},\"filepath\":\"{}\",\"number\":{}}}",
-                span_hex, file_id, filepath, number
-            )
-            .ok()?;
-            return Some(payload);
+            return Some((filepath, None, None, Some(number), true));
         }
 
         if number >= RANGE_BASE {
             let range = number - RANGE_BASE;
             let start = range >> RANGE_PART_SHIFT;
             let end = range & RANGE_PART_MASK;
-            write!(
-                &mut payload,
-                "{{\"span\":\"{}\",\"fileId\":{},\"filepath\":\"{}\",\"start\":{},\"end\":{},\"is_range\":true}}",
-                span_hex, file_id, filepath, start, end
-            )
-            .ok()?;
-            return Some(payload);
+            return Some((filepath, Some(start as usize), Some(end as usize), None, false));
         }
 
         // Numbered span (fallback to number only).
-        write!(
-            &mut payload,
-            "{{\"span\":\"{}\",\"fileId\":{},\"filepath\":\"{}\",\"number\":{}}}",
-            span_hex, file_id, filepath, number
-        )
-        .ok()?;
+        Some((filepath, None, None, Some(number), false))
+    }
 
-        Some(payload)
+    pub fn source_loc_from_span(&self, span_hex: String) -> Option<String> {
+        self.resolve_span_loc(&span_hex).map(|(filepath, start, end, number, detached)| {
+            let mut payload = String::new();
+            use std::fmt::Write as _;
+
+            if let (Some(s), Some(e)) = (start, end) {
+                write!(
+                    &mut payload,
+                    "{{\"span\":\"{}\",\"filepath\":\"{}\",\"start\":{},\"end\":{},\"is_range\":true}}",
+                    span_hex, filepath, s, e
+                )
+                .ok();
+            } else if detached {
+                write!(
+                    &mut payload,
+                    "{{\"span\":\"{}\",\"detached\":true,\"filepath\":\"{}\",\"number\":{}}}",
+                    span_hex,
+                    filepath,
+                    number.unwrap_or_default()
+                )
+                .ok();
+            } else if let Some(num) = number {
+                write!(
+                    &mut payload,
+                    "{{\"span\":\"{}\",\"filepath\":\"{}\",\"number\":{}}}",
+                    span_hex, filepath, num
+                )
+                .ok();
+            }
+
+            payload
+        })
+    }
+
+    #[wasm_bindgen(js_name = "source_locs_from_spans")]
+    pub fn source_locs_from_spans(&self, spans: js_sys::Array) -> JsValue {
+        let result = Object::new();
+
+        for span in spans.iter() {
+            if let Some(span_str) = span.as_string() {
+                if let Some((filepath, start, end, number, detached)) = self.resolve_span_loc(&span_str) {
+                    let loc = Object::new();
+                    let _ = Reflect::set(&loc, &JsValue::from_str("filepath"), &JsValue::from_str(&filepath));
+                    if let (Some(s), Some(e)) = (start, end) {
+                        let _ = Reflect::set(&loc, &JsValue::from_str("start"), &JsValue::from_f64(s as f64));
+                        let _ = Reflect::set(&loc, &JsValue::from_str("end"), &JsValue::from_f64(e as f64));
+                    }
+                    if let Some(num) = number {
+                        let _ = Reflect::set(&loc, &JsValue::from_str("number"), &JsValue::from_f64(num as f64));
+                    }
+                    let _ = Reflect::set(&loc, &JsValue::from_str("detached"), &JsValue::from_bool(detached));
+                    let _ = Reflect::set(&result, &JsValue::from_str(&span_str), &loc);
+                }
+            }
+        }
+
+        result.into()
     }
 
     pub(crate) fn reset(&mut self) {

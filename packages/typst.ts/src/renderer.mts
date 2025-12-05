@@ -169,6 +169,11 @@ export class RenderSession {
     return (this[kObject] as typst.RenderSession).source_loc_from_span(spanHex);
   }
 
+  getSourceLocsFromSpans(spanHexes: string[]): Record<string, any> | undefined {
+    const arr = new (globalThis.Array)(...spanHexes);
+    return (this[kObject] as typst.RenderSession).source_locs_from_spans(arr) as any;
+  }
+
   /**
    * See {@link TypstRenderer#renderSvg} for more details.
    */

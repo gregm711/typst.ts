@@ -16,8 +16,34 @@ pub struct IncrDocServer {
     /// Initially it is None meaning no completed compilation.
     pages: Option<Vec<Page>>,
 
+    /// GC policy to avoid full scans on every incremental compile.
+    gc_policy: GcPolicy,
+    /// Number of incremental compiles since last GC.
+    gc_counter: u32,
+
     /// Maintaining typst -> vector status
     typst2vec: IncrTypst2VecPass,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GcPolicy {
+    /// Trigger GC when item count exceeds this threshold.
+    min_items: usize,
+    /// Trigger GC every `interval` compiles regardless of size.
+    interval: u32,
+    /// Lifetime threshold passed to typst2vec.gc (kept consistent with existing behavior).
+    lifetime_threshold: u64,
+}
+
+impl Default for GcPolicy {
+    fn default() -> Self {
+        // Conservative defaults: scan every 100 compiles or after 10k items.
+        Self {
+            min_items: 10_000,
+            interval: 100,
+            lifetime_threshold: 5 * 2,
+        }
+    }
 }
 
 impl IncrDocServer {
@@ -35,8 +61,18 @@ impl IncrDocServer {
         // Increment the lifetime of all items to touch.
         self.typst2vec.increment_lifetime();
 
-        // it is important to call gc before building pages
-        let gc_items = self.typst2vec.gc(5 * 2);
+        // Decide whether to GC this cycle.
+        self.gc_counter = self.gc_counter.wrapping_add(1);
+        let items_len = self.typst2vec.items_len();
+        let should_gc = self.gc_counter % self.gc_policy.interval == 0
+            || items_len > self.gc_policy.min_items;
+
+        let gc_items = if should_gc {
+            self.gc_counter = 0; // reset counter on GC
+            self.typst2vec.gc(self.gc_policy.lifetime_threshold)
+        } else {
+            Vec::new()
+        };
 
         // run typst2vec pass
         let pages = self.typst2vec.doc(output);

@@ -204,6 +204,13 @@ mod tests {
         let bytes = serializer.into_serializer().into_inner();
 
         let ret = bytes.into_vec();
-        assert_eq!("00010203706e6700f8ffffff04000000f4ffffff030000000a0000000a000000efbeadde000000000000000000000000000000000000000000000000000000000000204100002041c0ffffff", hex::encode(ret));
+
+        // Validate round-trip instead of hard-coding platform-dependent bytes.
+        use rkyv::{archived_root, de::deserializers::SharedDeserializeMap, Deserialize};
+        let archived = unsafe { archived_root::<ImageItem>(&ret) };
+        let decoded: ImageItem = archived
+            .deserialize(&mut SharedDeserializeMap::new())
+            .expect("image deserialization");
+        assert_eq!(decoded, img);
     }
 }
