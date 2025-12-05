@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     hash::Hash,
     sync::{atomic::AtomicU64, Arc},
 };
@@ -20,8 +20,8 @@ use typst::{
     foundations::{Bytes, Smart},
     introspection::{Introspector, Tag},
     layout::{
-        Abs as TypstAbs, Axes, Dir, Frame, FrameItem, FrameKind, Position, Ratio as TypstRatio,
-        Size as TypstSize, Transform as TypstTransform,
+        Abs as TypstAbs, Axes, Dir, Frame, FrameItem, FrameKind, Point as TypstPoint,
+        Position, Ratio as TypstRatio, Size as TypstSize, Transform as TypstTransform,
     },
     model::Destination,
     syntax::Span,
@@ -38,7 +38,9 @@ use crate::{
     convert::ImageExt,
     font::GlyphProvider,
     hash::{Fingerprint, FingerprintBuilder},
-    layout::{inflate_rect_by_stroke, PageLayout, SpanBBox},
+    layout::{
+        inflate_rect_by_stroke, PageGlyphPositions, PageLayout, SpanBBox, SpanGlyphPositions,
+    },
     ir::{self, *},
     path2d::SvgPath2DBuilder,
     utils::{AbsExt, ToCssExt},
@@ -55,9 +57,25 @@ thread_local! {
     static PATH_STYLE_BUF: RefCell<Vec<PathStyle>> = RefCell::new(Vec::new());
 }
 
-#[derive(Default)]
 struct LayoutCollector {
     spans: Mutex<HashMap<u64, Rect>>,
+    glyphs: Mutex<HashMap<u64, GlyphRun>>,
+}
+
+impl Default for LayoutCollector {
+    fn default() -> Self {
+        Self {
+            spans: Mutex::new(HashMap::new()),
+            glyphs: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct GlyphRun {
+    positions: Vec<f32>,
+    glyph_spans: Vec<u64>,
+    dir_rtl: bool,
 }
 
 impl LayoutCollector {
@@ -78,6 +96,27 @@ impl LayoutCollector {
             .or_insert(world);
     }
 
+    fn record_glyph_positions(
+        &self,
+        span: u64,
+        positions: Vec<f32>,
+        glyph_spans: Vec<u64>,
+        dir_rtl: bool,
+    ) {
+        if span == 0 || positions.is_empty() {
+            return;
+        }
+        let mut glyphs = self.glyphs.lock();
+        glyphs.insert(
+            span,
+            GlyphRun {
+                positions,
+                glyph_spans,
+                dir_rtl,
+            },
+        );
+    }
+
     fn to_page_layout(&self, page: u32) -> PageLayout {
         let spans = self
             .spans
@@ -94,19 +133,28 @@ impl LayoutCollector {
 
         PageLayout { page, spans }
     }
+
+    fn to_page_glyph_map(&self, page: u32) -> PageGlyphPositions {
+        let spans = self
+            .glyphs
+            .lock()
+            .iter()
+            .map(|(span, run)| SpanGlyphPositions {
+                span: *span,
+                positions: run.positions.clone(),
+                glyph_spans: run.glyph_spans.clone(),
+                dir_rtl: run.dir_rtl,
+            })
+            .collect();
+
+        PageGlyphPositions { page, spans }
+    }
 }
 
 fn rect_from_size(size: Axes<TypstAbs>) -> Rect {
     Rect {
         lo: Point::new(Scalar(0.), Scalar(0.)),
         hi: Point::new(Scalar(size.x.to_f32()), Scalar(size.y.to_f32())),
-    }
-}
-
-fn rect_from_typst(rect: typst::layout::Rect) -> Rect {
-    Rect {
-        lo: Point::new(Scalar(rect.min.x.to_pt() as f32), Scalar(rect.min.y.to_pt() as f32)),
-        hi: Point::new(Scalar(rect.max.x.to_pt() as f32), Scalar(rect.max.y.to_pt() as f32)),
     }
 }
 
@@ -124,6 +172,13 @@ fn transform_rect(rect: Rect, transform: Transform) -> Rect {
     tiny_skia_path::Rect::from_points(&corners)
         .map(From::from)
         .unwrap_or_else(Rect::empty)
+}
+
+fn transform_point(point: Point, transform: Transform) -> Point {
+    let ts: SkTransform = transform.into();
+    let mut p = [tiny_skia_path::Point::from(point)];
+    ts.map_points(&mut p);
+    Point::from(p[0])
 }
 
 #[derive(Clone, Copy)]
@@ -323,14 +378,20 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         }
     }
 
-    pub fn doc(&self, doc: &TypstDocument) -> (Vec<Page>, Vec<PageLayout>) {
+    pub fn doc(
+        &self,
+        doc: &TypstDocument,
+    ) -> (Vec<Page>, Vec<PageLayout>, Vec<PageGlyphPositions>) {
         match doc {
             TypstDocument::Html(doc) => self.html(doc),
             TypstDocument::Paged(doc) => self.paged(doc),
         }
     }
 
-    pub fn html(&self, doc: &TypstHtmlDocument) -> (Vec<Page>, Vec<PageLayout>) {
+    pub fn html(
+        &self,
+        doc: &TypstHtmlDocument,
+    ) -> (Vec<Page>, Vec<PageLayout>, Vec<PageGlyphPositions>) {
         let doc_reg = self.spans.start();
 
         let page_reg = self.spans.start();
@@ -356,13 +417,20 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             .doc_region
             .store(doc_reg, std::sync::atomic::Ordering::SeqCst);
 
-        (vec![root], vec![])
+        (vec![root], vec![], vec![])
     }
 
-    pub fn paged(&self, doc: &TypstPagedDocument) -> (Vec<Page>, Vec<PageLayout>) {
+    pub fn paged(
+        &self,
+        doc: &TypstPagedDocument,
+    ) -> (
+        Vec<Page>,
+        Vec<PageLayout>,
+        Vec<PageGlyphPositions>,
+    ) {
         let doc_reg = self.spans.start();
 
-        let results: Vec<(Page, PageLayout)> = doc
+        let results: Vec<(Page, PageLayout, PageGlyphPositions)> = doc
             .pages
             .par_iter()
             .enumerate()
@@ -394,6 +462,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         size: p.frame.size().into_typst(),
                     },
                     layout.to_page_layout(idx as u32),
+                    layout.to_page_glyph_map(idx as u32),
                 )
             })
             .collect();
@@ -402,9 +471,17 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             .doc_region
             .store(doc_reg, std::sync::atomic::Ordering::SeqCst);
 
-        let (pages, layout_map): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+        let (pages, layout_map, glyph_map) =
+            results
+                .into_iter()
+                .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, (p, l, g)| {
+                    acc.0.push(p);
+                    acc.1.push(l);
+                    acc.2.push(g);
+                    acc
+                });
 
-        (pages, layout_map)
+        (pages, layout_map, glyph_map)
     }
 
     fn frame(
@@ -543,18 +620,104 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                     });
 
                     if let Some(layout) = &layout {
-                        let mut seen = HashSet::new();
-                        let mut rect = rect_from_typst(text.bbox());
-                        if let Some(stroke) = text.stroke.as_ref() {
-                            rect = inflate_rect_by_stroke(rect, stroke);
-                        }
-                        let spans = text.glyphs.iter().map(|g| g.span);
-                        for span in spans {
-                            let id = span.0.into_raw().get();
-                            if id == 0 || !seen.insert(id) {
-                                continue;
+                        // Compute per-span bounds and glyph x positions (page space).
+                        let dir_rtl = false;
+                        let mut cursor = TypstPoint::zero();
+                        let mut per_span_bounds: HashMap<u64, Rect> = HashMap::new();
+                        let mut per_span_glyphs: HashMap<u64, (Vec<f32>, Vec<u64>, Option<f32>)> =
+                            HashMap::new();
+
+                        for glyph in &text.glyphs {
+                            let advance = TypstPoint::new(
+                                glyph.x_advance.at(text.size),
+                                glyph.y_advance.at(text.size),
+                            );
+                            let offset = TypstPoint::new(
+                                glyph.x_offset.at(text.size),
+                                glyph.y_offset.at(text.size),
+                            );
+
+                            let id = glyph.span.0.into_raw().get();
+
+                            if let Some(bb) =
+                                text.font.ttf().glyph_bounding_box(ttf_parser::GlyphId(glyph.id))
+                            {
+                                let pos = cursor + offset;
+                                let a = pos
+                                    + TypstPoint::new(
+                                        text.font.to_em(bb.x_min).at(text.size),
+                                        text.font.to_em(bb.y_min).at(text.size),
+                                    );
+                                let b = pos
+                                    + TypstPoint::new(
+                                        text.font.to_em(bb.x_max).at(text.size),
+                                        text.font.to_em(bb.y_max).at(text.size),
+                                    );
+
+                                // Convert glyph box to frame coordinates (y-down).
+                                let min_x = a.x.min(b.x).to_pt() as f32;
+                                let max_x = a.x.max(b.x).to_pt() as f32;
+                                let mut min_y = -(a.y.max(b.y)).to_pt() as f32;
+                                let mut max_y = -(a.y.min(b.y)).to_pt() as f32;
+                                if min_y > max_y {
+                                    std::mem::swap(&mut min_y, &mut max_y);
+                                }
+
+                                let mut rect = Rect {
+                                    lo: Point::new(Scalar(min_x), Scalar(min_y)),
+                                    hi: Point::new(Scalar(max_x), Scalar(max_y)),
+                                };
+
+                                if let Some(stroke) = text.stroke.as_ref() {
+                                    rect = inflate_rect_by_stroke(rect, stroke);
+                                }
+
+                                if id != 0 {
+                                    per_span_bounds
+                                        .entry(id)
+                                        .and_modify(|existing| *existing = existing.union(&rect))
+                                        .or_insert(rect);
+                                }
                             }
+
+                            if id != 0 {
+                                let start = cursor + offset;
+                                let end = start + advance;
+                                let start_point = transform_point(
+                                    Point::new(
+                                        Scalar(start.x.to_pt() as f32),
+                                        Scalar(-(start.y.to_pt() as f32)),
+                                    ),
+                                    state.transform,
+                                );
+                                let end_point = transform_point(
+                                    Point::new(
+                                        Scalar(end.x.to_pt() as f32),
+                                        Scalar(-(end.y.to_pt() as f32)),
+                                    ),
+                                    state.transform,
+                                );
+
+                                let entry = per_span_glyphs
+                                    .entry(id)
+                                    .or_insert_with(|| (Vec::new(), Vec::new(), None));
+                                entry.0.push(start_point.x.0);
+                                entry.1.push(id);
+                                entry.2 = Some(end_point.x.0);
+                            }
+
+                            cursor += advance;
+                        }
+
+                        for (id, rect) in per_span_bounds {
                             layout.record_span(id, rect, state.transform);
+                        }
+
+                        for (id, (mut positions, glyph_spans, last_end)) in per_span_glyphs {
+                            if let Some(end_x) = last_end {
+                                positions.push(end_x);
+                            }
+                            layout.record_glyph_positions(id, positions, glyph_spans, dir_rtl);
                         }
                     }
 

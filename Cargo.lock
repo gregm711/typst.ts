@@ -5482,6 +5482,7 @@ dependencies = [
  "reflexo-vec2svg",
  "sha2",
  "tokio",
+ "typst",
  "typst-ts-dev-server",
  "typst-ts-test-common",
 ]

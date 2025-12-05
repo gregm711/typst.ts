@@ -21,6 +21,26 @@ pub struct PageLayout {
     pub spans: Vec<SpanBBox>,
 }
 
+/// Glyph-level x positions for a span (page coordinates, points).
+#[derive(Debug, Clone, Serialize)]
+pub struct SpanGlyphPositions {
+    #[serde(serialize_with = "crate::layout::serialize_span_hex")]
+    pub span: u64,
+    /// X positions of glyph edges in page space, sorted in visual order.
+    pub positions: Vec<f32>,
+    /// Span ids for each glyph (mirrors Typst glyph span ids to resolve source).
+    pub glyph_spans: Vec<u64>,
+    /// True if the run is right-to-left.
+    pub dir_rtl: bool,
+}
+
+/// A page worth of glyph positions.
+#[derive(Debug, Clone, Serialize)]
+pub struct PageGlyphPositions {
+    pub page: u32,
+    pub spans: Vec<SpanGlyphPositions>,
+}
+
 /// Inflate a rectangle by half the stroke thickness in all directions.
 /// Used to approximate the visual bounds of stroked shapes/text.
 pub(crate) fn inflate_rect_by_stroke(rect: Rect, stroke: &FixedStroke) -> Rect {

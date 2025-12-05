@@ -11,12 +11,22 @@ use reflexo_vec2svg::IncrSvgDocClient;
 
 fn get_driver(workspace_dir: &Path, entry_file_path: &Path) -> TypstSystemUniverse {
     let project_base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo_root = project_base.parent().map(|p| p.to_path_buf());
     let w = project_base.join("fonts");
     let font_path = project_base.join("assets/fonts");
+    let public_fonts = repo_root
+        .map(|r| r.join("public/fonts"))
+        .filter(|p| p.exists());
     let verse = TypstSystemUniverse::new(CompileOpts {
         entry: EntryOpts::new_workspace(workspace_dir.into()),
-        no_system_fonts: true,
-        font_paths: vec![w, font_path],
+        no_system_fonts: false,
+        font_paths: {
+            let mut paths = vec![w, font_path];
+            if let Some(p) = public_fonts {
+                paths.push(p);
+            }
+            paths
+        },
         ..CompileOpts::default()
     })
     .unwrap();
@@ -107,6 +117,8 @@ mod tests {
     use super::*;
     use reflexo::hash::Fingerprint;
     use reflexo_typst2vec::stream::BytesModuleStream;
+    use std::collections::HashSet;
+    use std::fs;
     use std::path::Path;
 
     /// Compile source through the incremental server/client pipeline and return page fingerprints.
@@ -268,6 +280,231 @@ Page four base content.
             has_zero_sized,
             "expected a bbox for the zero-sized stroked box (tiny but non-zero)"
         );
+    }
+
+    #[test]
+    fn layout_map_uses_per_span_glyph_bounds_for_text() {
+        // Use a real template to ensure spans are present and distinct.
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("workspace root")
+            .to_path_buf();
+        let entry = project_root.join("public/templates/paper.typ");
+        assert!(
+            entry.exists(),
+            "paper template should exist at {:?}",
+            entry
+        );
+
+        let driver = get_driver(&project_root, &entry);
+        let mut server = IncrDocServer::default();
+        server.set_should_attach_debug_info(true);
+
+        let paged_doc = driver
+            .snapshot_with_entry_content(
+                Bytes::from_string(fs::read_to_string(&entry).expect("read template")),
+                None,
+            )
+            .compile()
+            .output
+            .expect("compile template");
+
+        let typst_doc = TypstDocument::Paged(paged_doc.clone());
+        let delta = server.pack_delta(&typst_doc);
+        assert_eq!(delta.layout_map.len(), paged_doc.pages.len(), "page count");
+
+        let spans = &delta.layout_map[0].spans;
+        assert!(
+            spans.len() >= 2,
+            "expected multiple spans on first page of paper template, got {}",
+            spans.len()
+        );
+
+        let unique_x: HashSet<i32> = spans
+            .iter()
+            .map(|b| (b.x * 1000.0).round() as i32)
+            .collect();
+        let widths: HashSet<i32> = spans
+            .iter()
+            .map(|b| (b.width * 1000.0).round() as i32)
+            .collect();
+        assert!(
+            unique_x.len() >= 2 && widths.len() >= 2,
+            "per-span bboxes should not collapse to identical X/width; spans: {:?}",
+            spans
+        );
+    }
+
+    #[test]
+    fn layout_map_covers_common_templates() {
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("workspace root")
+            .to_path_buf();
+
+        let templates: &[(&str, usize)] = &[
+            ("public/templates/ieee.typ", 50),
+            ("public/templates/paper.typ", 20),
+            ("public/templates/thesis.typ", 50),
+        ];
+
+        for (rel_path, min_spans) in templates {
+            let entry = project_root.join(rel_path);
+            assert!(
+                entry.exists(),
+                "template {} should exist at {:?}",
+                rel_path,
+                entry
+            );
+
+            let driver = get_driver(&project_root, &entry);
+            let mut server = IncrDocServer::default();
+            server.set_should_attach_debug_info(true);
+
+            let paged_doc = driver
+                .snapshot_with_entry_content(
+                    Bytes::from_string(fs::read_to_string(&entry).expect("read template")),
+                    None,
+                )
+                .compile()
+                .output
+                .expect("compile template");
+
+            let page_count = paged_doc.pages.len();
+            let typst_doc = TypstDocument::Paged(paged_doc.clone());
+            let delta = server.pack_delta(&typst_doc);
+
+            assert_eq!(
+                delta.layout_map.len(),
+                page_count,
+                "layout map pages should match document pages for {}",
+                rel_path
+            );
+
+            let total_spans: usize = delta.layout_map.iter().map(|p| p.spans.len()).sum();
+            assert!(
+                total_spans >= *min_spans,
+                "expected at least {} spans in layout map for {}, got {}",
+                min_spans,
+                rel_path,
+                total_spans
+            );
+
+            for page in &delta.layout_map {
+                assert!(
+                    !page.spans.is_empty(),
+                    "page {} of {} has no span bboxes",
+                    page.page,
+                    rel_path
+                );
+                let page_size = paged_doc
+                    .pages
+                    .get(page.page as usize)
+                    .expect("page exists in paged_doc")
+                    .frame
+                    .size();
+                let page_w = page_size.x.to_pt() as f32;
+                let page_h = page_size.y.to_pt() as f32;
+                for bbox in &page.spans {
+                    assert!(
+                        bbox.width > 0.0 && bbox.height > 0.0,
+                        "zero-sized bbox in {} page {}: {:?}",
+                        rel_path,
+                        page.page,
+                        bbox
+                    );
+                    // Allow a small tolerance for stroke inflation and glyph ascenders that
+                    // protrude slightly outside the nominal page box.
+                    let epsilon = 4.0;
+                    assert!(
+                        bbox.x + bbox.width <= page_w + epsilon,
+                        "bbox exceeds page width in {} page {}: {:?} (page_w={})",
+                        rel_path,
+                        page.page,
+                        bbox,
+                        page_w
+                    );
+                    assert!(
+                        bbox.y + bbox.height <= page_h + epsilon,
+                        "bbox exceeds page height in {} page {}: {:?} (page_h={})",
+                        rel_path,
+                        page.page,
+                        bbox,
+                        page_h
+                    );
+                    assert!(
+                        bbox.x >= -epsilon && bbox.y >= -epsilon,
+                        "bbox has negative origin in {} page {}: {:?}",
+                        rel_path,
+                        page.page,
+                        bbox
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn glyph_positions_align_with_glyph_spans() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+
+        let source = r#"
+#set page(width: 200pt, height: 100pt, margin: 10pt)
+Hello world!
+"#;
+
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc));
+        let glyph_map = delta.glyph_map;
+
+        assert!(
+            !glyph_map.is_empty(),
+            "glyph_map should contain at least one page"
+        );
+
+        let page0 = &glyph_map[0];
+        assert!(
+            !page0.spans.is_empty(),
+            "glyph_map page 0 should contain at least one span run"
+        );
+
+        for run in &page0.spans {
+            let positions = &run.positions;
+            let glyphs = &run.glyph_spans;
+            assert!(
+                positions.len() >= 2,
+                "positions should include start and end edges"
+            );
+            assert_eq!(
+                positions.len(),
+                glyphs.len() + 1,
+                "positions should be glyph_count + 1 for trailing edge"
+            );
+            // Positions must be non-decreasing; allow zero-width glyphs but require some advance.
+            let mut has_advance = false;
+            for window in positions.windows(2) {
+                assert!(
+                    window[0] <= window[1],
+                    "glyph positions must be non-decreasing"
+                );
+                if window[1] > window[0] {
+                    has_advance = true;
+                }
+            }
+            assert!(
+                has_advance,
+                "expected at least one glyph with positive advance in span {}",
+                run.span
+            );
+        }
     }
 
 }

@@ -725,6 +725,10 @@ impl TypstCompileWorld {
             }
         };
 
+        // Serialize glyph positions from typst2vec lowering (page-space x positions).
+        let glyph_positions_js =
+            serde_wasm_bindgen::to_value(&delta.glyph_map).unwrap_or(JsValue::NULL);
+
         // Collect syntax nodes for editor protection (headings, lists, math, etc.)
         let syntax_nodes = self.collect_syntax_nodes();
         let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
@@ -739,6 +743,7 @@ impl TypstCompileWorld {
             js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
             js_sys::Reflect::set(&result, &"lineBoxes".into(), &line_boxes_js)?;
             js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
+            js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
             js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
             js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
             console_log(format!("[incr_compile] Result object created, glyphMaps set (value is_null={})", glyph_maps_js.is_null()));

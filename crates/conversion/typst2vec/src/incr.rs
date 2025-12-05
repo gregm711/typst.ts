@@ -3,7 +3,7 @@ use reflexo::typst::TypstDocument;
 use reflexo::vector::ir::{ModuleMetadata, Page};
 
 use super::ir::FlatModule;
-use super::layout::PageLayout;
+use super::layout::{PageGlyphPositions, PageLayout};
 use super::pass::IncrTypst2VecPass;
 use crate::debug_loc::{ElementPoint, SourceSpanOffset};
 
@@ -14,6 +14,7 @@ pub use reflexo::vector::incr::{IncrDocClient, IncrDocClientKern};
 pub struct PackedDelta {
     pub bytes: Vec<u8>,
     pub layout_map: Vec<PageLayout>,
+    pub glyph_map: Vec<PageGlyphPositions>,
 }
 
 /// maintains the data of the incremental rendering at server side
@@ -82,7 +83,7 @@ impl IncrDocServer {
         };
 
         // run typst2vec pass
-        let (pages, layout_map) = self.typst2vec.doc(output);
+        let (pages, layout_map, glyph_map) = self.typst2vec.doc(output);
         self.pages = Some(pages.clone());
 
         // let new_items = builder.new_items.get_mut().len();
@@ -132,6 +133,7 @@ impl IncrDocServer {
         PackedDelta {
             bytes: [b"diff-v1,", delta.as_slice()].concat(),
             layout_map,
+            glyph_map,
         }
     }
 
