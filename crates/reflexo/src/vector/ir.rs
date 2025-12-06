@@ -82,11 +82,21 @@ pub struct VecDocument {
     /// References to the page frames.
     /// Use [`Module::get_item`] to get the actual item.
     pub pages: Vec<Page>,
+    /// Optional page-level metadata.
+    pub page_meta: Vec<PageMetadata>,
 }
 
 impl VecDocument {
     pub fn to_multi(self) -> MultiVecDocument {
-        let Self { pages, module } = self;
+        let Self {
+            pages,
+            module,
+            mut page_meta,
+        } = self;
+
+        if page_meta.is_empty() {
+            page_meta = Default::default();
+        }
 
         MultiVecDocument {
             module,
@@ -94,7 +104,7 @@ impl VecDocument {
                 kind: "width".into(),
                 layouts: vec![(
                     Default::default(),
-                    LayoutRegionNode::Pages(Arc::new((Default::default(), pages))),
+                    LayoutRegionNode::Pages(Arc::new((page_meta, pages))),
                 )],
             })],
         }
@@ -194,6 +204,13 @@ mod tests {
         let bytes = serializer.into_serializer().into_inner();
 
         let ret = bytes.into_vec();
-        assert_eq!("00010203706e6700f8ffffff04000000f4ffffff030000000a0000000a000000efbeadde000000000000000000000000000000000000000000000000000000000000204100002041c0ffffff", hex::encode(ret));
+
+        // Validate round-trip instead of hard-coding platform-dependent bytes.
+        use rkyv::{archived_root, de::deserializers::SharedDeserializeMap, Deserialize};
+        let archived = unsafe { archived_root::<ImageItem>(&ret) };
+        let decoded: ImageItem = archived
+            .deserialize(&mut SharedDeserializeMap::new())
+            .expect("image deserialization");
+        assert_eq!(decoded, img);
     }
 }

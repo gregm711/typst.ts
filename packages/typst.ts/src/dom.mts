@@ -206,6 +206,40 @@ export function provideDomDoc<TBase extends GConstructor<TypstDocumentContext<In
         const browserBBox = page.getBoundingClientRect();
         const v = this.getDomViewport(window, browserBBox);
 
+        const pageWidthAttr = Number.parseFloat(page.getAttribute('data-width') || '');
+        const pageHeightAttr = Number.parseFloat(page.getAttribute('data-height') || '');
+
+        const wScale =
+          (browserBBox.width && pageWidthAttr
+            ? pageWidthAttr / browserBBox.width
+            : 1) * this.domScale;
+        const hScale =
+          (browserBBox.height && pageHeightAttr
+            ? pageHeightAttr / browserBBox.height
+            : 1) * this.domScale;
+
+        // Convert viewport to page-local coords before any stage, so Layout sees the same
+        // coordinates as SVG/Semantics. Also add the padding for visibility margin.
+        v.x *= wScale;
+        v.y *= hScale;
+        v.y -= 100;
+        v.width *= wScale;
+        v.height *= hScale;
+        v.height += 200;
+
+        // Clamp viewport to the page bounds in page-local coordinates to avoid
+        // skipping repaint when the raw viewport is far outside due to browser coords.
+        const pageHeight = pageHeightAttr || v.height;
+        const clampedTop = Math.max(0, Math.min(v.y, pageHeight));
+        const clampedBottom = Math.max(0, Math.min(v.y + v.height, pageHeight));
+        if (clampedBottom <= clampedTop) {
+          v.y = 0;
+          v.height = pageHeight;
+        } else {
+          v.y = clampedTop;
+          v.height = clampedBottom - clampedTop;
+        }
+
         const needCalc = (stage: RepaintStage) =>
           this.docKernel.need_repaint(i, v.x, v.y, v.width, v.height, stage);
         const repaint = (stage: RepaintStage) =>
@@ -218,21 +252,6 @@ export function provideDomDoc<TBase extends GConstructor<TypstDocumentContext<In
         };
 
         await calc(RepaintStage.Layout);
-
-        const wScale =
-          (browserBBox.width
-            ? Number.parseFloat(page.getAttribute('data-width')!) / browserBBox.width
-            : 1) * this.domScale;
-        const hScale =
-          (browserBBox.height
-            ? Number.parseFloat(page.getAttribute('data-height')!) / browserBBox.height
-            : 1) * this.domScale;
-        v.x *= wScale;
-        v.y *= hScale;
-        v.y -= 100;
-        v.width *= wScale;
-        v.height *= hScale;
-        v.height += 200;
 
         await calc(RepaintStage.Svg);
         await calc(RepaintStage.Semantics);

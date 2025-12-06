@@ -1,14 +1,16 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use reflexo_typst::error::prelude::*;
 #[cfg(feature = "render_svg")]
 use reflexo_typst::svg::IncrSvgDocClient;
-use reflexo_typst::vector::ir::{Page, Scalar};
+use reflexo_typst::vector::ir::{Page, PageMetadata, Scalar};
 use reflexo_typst2vec::incr::IncrDocClient;
 #[cfg(feature = "render_canvas")]
 use reflexo_vec2canvas::IncrCanvasDocClient;
 #[cfg(feature = "rkyv")]
 use rkyv::{Archive, Deserialize, Serialize};
+use js_sys::{Array, Object, Reflect};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -174,6 +176,10 @@ pub struct RenderSession {
 
     /// underlying communication client model
     pub(crate) client: Arc<Mutex<IncrDocClient>>,
+    /// file id -> path mapping extracted from layout metadata
+    pub(crate) file_map: std::sync::Mutex<HashMap<u32, String>>,
+    /// span id -> (file_id, start, end) mapping
+    pub(crate) span_map: std::sync::Mutex<HashMap<u64, (u32, usize, usize)>>,
     /// underlying incremental state of canvas rendering
     #[cfg(feature = "render_canvas")]
     pub(crate) canvas_kern: Arc<Mutex<IncrCanvasDocClient>>,
@@ -230,9 +236,117 @@ impl RenderSession {
         self.client().kern().source_span(path)
     }
 
+    fn resolve_span_loc(
+        &self,
+        span_hex: &str,
+    ) -> Option<(String, Option<usize>, Option<usize>, Option<u64>, bool)> {
+        let raw = u64::from_str_radix(span_hex, 16).ok()?;
+
+        // Mirror typst::syntax::Span layout:
+        const NUMBER_BITS: u64 = 48;
+        const NUMBER_MASK: u64 = (1u64 << NUMBER_BITS) - 1;
+        const RANGE_BASE: u64 = 1u64 << 47;
+        const RANGE_PART_BITS: u64 = 23;
+        const RANGE_PART_SHIFT: u64 = RANGE_PART_BITS;
+        const RANGE_PART_MASK: u64 = (1u64 << RANGE_PART_BITS) - 1;
+
+        let file_id = raw >> NUMBER_BITS;
+        let number = raw & NUMBER_MASK;
+
+        let filepath = {
+            let map = self.file_map.lock().unwrap();
+            map.get(&(file_id as u32)).cloned().unwrap_or_else(|| {
+                if file_id == 0 {
+                    "/main.typ".to_string()
+                } else {
+                    format!("file-{file_id}")
+                }
+            })
+        };
+
+        if let Some((_, start, end)) = self.span_map.lock().unwrap().get(&raw) {
+            return Some((filepath, Some(*start), Some(*end), None, false));
+        }
+
+        if number < 2 {
+            return Some((filepath, None, None, Some(number), true));
+        }
+
+        if number >= RANGE_BASE {
+            let range = number - RANGE_BASE;
+            let start = range >> RANGE_PART_SHIFT;
+            let end = range & RANGE_PART_MASK;
+            return Some((filepath, Some(start as usize), Some(end as usize), None, false));
+        }
+
+        // Numbered span (fallback to number only).
+        Some((filepath, None, None, Some(number), false))
+    }
+
+    pub fn source_loc_from_span(&self, span_hex: String) -> Option<String> {
+        self.resolve_span_loc(&span_hex).map(|(filepath, start, end, number, detached)| {
+            let mut payload = String::new();
+            use std::fmt::Write as _;
+
+            if let (Some(s), Some(e)) = (start, end) {
+                write!(
+                    &mut payload,
+                    "{{\"span\":\"{}\",\"filepath\":\"{}\",\"start\":{},\"end\":{},\"is_range\":true}}",
+                    span_hex, filepath, s, e
+                )
+                .ok();
+            } else if detached {
+                write!(
+                    &mut payload,
+                    "{{\"span\":\"{}\",\"detached\":true,\"filepath\":\"{}\",\"number\":{}}}",
+                    span_hex,
+                    filepath,
+                    number.unwrap_or_default()
+                )
+                .ok();
+            } else if let Some(num) = number {
+                write!(
+                    &mut payload,
+                    "{{\"span\":\"{}\",\"filepath\":\"{}\",\"number\":{}}}",
+                    span_hex, filepath, num
+                )
+                .ok();
+            }
+
+            payload
+        })
+    }
+
+    #[wasm_bindgen(js_name = "source_locs_from_spans")]
+    pub fn source_locs_from_spans(&self, spans: js_sys::Array) -> JsValue {
+        let result = Object::new();
+
+        for span in spans.iter() {
+            if let Some(span_str) = span.as_string() {
+                if let Some((filepath, start, end, number, detached)) = self.resolve_span_loc(&span_str) {
+                    let loc = Object::new();
+                    let _ = Reflect::set(&loc, &JsValue::from_str("filepath"), &JsValue::from_str(&filepath));
+                    if let (Some(s), Some(e)) = (start, end) {
+                        let _ = Reflect::set(&loc, &JsValue::from_str("start"), &JsValue::from_f64(s as f64));
+                        let _ = Reflect::set(&loc, &JsValue::from_str("end"), &JsValue::from_f64(e as f64));
+                    }
+                    if let Some(num) = number {
+                        let _ = Reflect::set(&loc, &JsValue::from_str("number"), &JsValue::from_f64(num as f64));
+                    }
+                    let _ = Reflect::set(&loc, &JsValue::from_str("detached"), &JsValue::from_bool(detached));
+                    let _ = Reflect::set(&result, &JsValue::from_str(&span_str), &loc);
+                }
+            }
+        }
+
+        result.into()
+    }
+
     pub(crate) fn reset(&mut self) {
         let mut client = self.client.lock().unwrap();
         *client = IncrDocClient::default();
+        self.file_map.lock().unwrap().clear();
+        self.span_map.lock().unwrap().clear();
         if cfg!(feature = "render_canvas") {
             let mut canvas_kern = self.canvas_kern.lock().unwrap();
             canvas_kern.reset();
@@ -246,6 +360,8 @@ impl RenderSession {
     pub(crate) fn reset_current(&mut self, delta: &[u8]) -> Result<()> {
         let mut client = self.client.lock().unwrap();
         *client = IncrDocClient::default();
+        self.file_map.lock().unwrap().clear();
+        self.span_map.lock().unwrap().clear();
         if cfg!(feature = "render_canvas") {
             let mut canvas_kern = self.canvas_kern.lock().unwrap();
             canvas_kern.reset();
@@ -254,12 +370,69 @@ impl RenderSession {
             let mut svg_kern = self.svg_kern.lock().unwrap();
             svg_kern.reset();
         }
-        Self::merge_delta_inner(&mut self.pages_info, &mut client, delta)
+        let res = Self::merge_delta_inner(&mut self.pages_info, &mut client, delta);
+        self.update_metadata(&client);
+        res
     }
 
     pub(crate) fn merge_delta(&mut self, delta: &[u8]) -> Result<()> {
         let mut client = self.client.lock().unwrap();
-        Self::merge_delta_inner(&mut self.pages_info, &mut client, delta)
+        let res = Self::merge_delta_inner(&mut self.pages_info, &mut client, delta);
+        self.update_metadata(&client);
+        res
+    }
+
+    pub(crate) fn update_metadata(&self, client: &IncrDocClient) {
+        if let Some(layout) = &client.layout {
+            let view = layout.pages(client.module());
+            if let Some(view) = view {
+                let meta = view.meta();
+
+                // Update file map
+                {
+                    let mut map = self.file_map.lock().unwrap();
+                    map.clear();
+                    for m in meta {
+                        if let PageMetadata::Custom(customs) = m {
+                            for (k, v) in customs {
+                                if k.as_ref() == "source_files" {
+                                    if let Ok(entries) =
+                                        serde_json::from_slice::<Vec<(u32, String)>>(v.as_ref())
+                                    {
+                                        for (id, path) in entries {
+                                            map.insert(id, path);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Update span map
+                {
+                    let mut map = self.span_map.lock().unwrap();
+                    map.clear();
+                    for m in meta {
+                        if let PageMetadata::Custom(customs) = m {
+                            for (k, v) in customs {
+                                if k.as_ref() == "span_ranges" {
+                                    if let Ok(entries) =
+                                        serde_json::from_slice::<Vec<(u64, u32, usize, usize)>>(
+                                            v.as_ref(),
+                                        )
+                                    {
+                                        for (span_id, file_id, start, end) in entries {
+                                            map.insert(span_id, (file_id, start, end));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn merge_delta_inner(

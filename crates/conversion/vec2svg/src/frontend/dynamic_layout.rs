@@ -15,7 +15,7 @@ impl DynamicLayoutSvgExporter {
         // check the document
         // let mut t = LowerBuilder::new(output);
 
-        let pages = self.typst2vec.doc(output);
+        let (pages, _, _) = self.typst2vec.doc(output);
 
         // log::trace!("svg dynamic layout render time: {:?}",
         // instant.elapsed());

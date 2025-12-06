@@ -44,7 +44,19 @@ pub struct LabelledRef(pub ImmutStr, pub Fingerprint);
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 #[cfg_attr(feature = "rkyv", derive(Archive, rDeser, rSer))]
 #[cfg_attr(feature = "rkyv-validation", archive(check_bytes))]
-pub struct GroupRef(pub Arc<[(Point, Fingerprint)]>);
+pub struct GroupRef {
+    pub items: Arc<[(Point, Fingerprint)]>,
+    pub span_id: Option<u64>,
+}
+
+impl From<Arc<[(Point, Fingerprint)]>> for GroupRef {
+    fn from(items: Arc<[(Point, Fingerprint)]>) -> Self {
+        Self {
+            items,
+            span_id: None,
+        }
+    }
+}
 
 /// References to a set of fonts.
 pub type FontPack = Vec<FontItem>;

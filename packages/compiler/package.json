@@ -9,12 +9,12 @@
     "Typst"
   ],
   "type": "module",
-  "module": "./pkg/wasm-pack-shim.mjs",
+  "module": "./pkg/typst_ts_web_compiler.js",
   "types": "./pkg/typst_ts_web_compiler.d.ts",
   "exports": {
     ".": {
       "types": "./pkg/typst_ts_web_compiler.d.ts",
-      "default": "./pkg/wasm-pack-shim.mjs"
+      "default": "./pkg/typst_ts_web_compiler.js"
     },
     "./wasm": {
       "types": "./pkg/typst_ts_web_compiler_bg.wasm.d.ts",

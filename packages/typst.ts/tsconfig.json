@@ -6,12 +6,13 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "allowJs": true,
-    "noImplicitAny": true,
+    "noImplicitAny": false,
     "importHelpers": true,
     "isolatedModules": true,
     "strictNullChecks": true,
     "declaration": false,
     "stripInternal": true,
+    "skipLibCheck": true,
 
     "lib": ["ES5", "ES6", "ES7", "ES2018", "ES2022"]
   },

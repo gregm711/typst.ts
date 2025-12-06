@@ -108,10 +108,10 @@ impl IncrDomDocClient {
         let page = &mut self.doc_view[page_num as usize];
 
         match stage {
-            STAGE_LAYOUT => Ok({
-                page.relayout(&self.canvas_backend)?;
-                false
-            }),
+            STAGE_LAYOUT => {
+                // Returns whether layout work was actually performed
+                page.relayout(&self.canvas_backend)
+            }
             STAGE_SVG => Ok(page.need_repaint_svg(viewport)),
             STAGE_SEMANTICS => Ok(page.need_repaint_semantics()),
             STAGE_PREPARE_CANVAS => {
@@ -153,6 +153,9 @@ impl IncrDomDocClient {
         let page = &mut self.doc_view[page_num as usize];
 
         match stage {
+            STAGE_LAYOUT => {
+                // Layout work is done in need_repaint; repaint is a no-op for this stage
+            }
             STAGE_SVG => {
                 page.repaint_svg(&mut ctx)?;
             }
@@ -284,21 +287,49 @@ impl IncrDomDocClient {
 
     fn retrack_pages(&mut self, kern: &mut IncrDocClient, elem: HookedElement) -> Result<bool> {
         // Checks out the current document layout.
-        let pages = self.checkout_pages(kern);
+        // Note: We need to be careful about borrow lifetimes here
+        let layout_version = kern.layout_version;
+        let pages_count = {
+            let pages = self.checkout_pages(kern);
+            pages.len()
+        };
 
-        let mut dirty = self.doc_view.len() != pages.len();
+        let mut dirty = self.doc_view.len() != pages_count;
+
+        web_sys::console::log_1(
+            &format!(
+                "[retrack_pages] doc_view.len={} pages_count={} initial_dirty={}",
+                self.doc_view.len(),
+                pages_count,
+                dirty
+            )
+            .into(),
+        );
 
         // Tracks the pages.
-        if self.doc_view.len() > pages.len() {
-            self.doc_view.truncate(pages.len());
+        if self.doc_view.len() > pages_count {
+            self.doc_view.truncate(pages_count);
         }
-        for i in self.doc_view.len()..pages.len() {
+        for i in self.doc_view.len()..pages_count {
+            web_sys::console::log_1(&format!("[retrack_pages] Creating new DomPage at index {}", i).into());
             self.doc_view
                 .push(DomPage::new_at(elem.hooked.clone(), self.tmpl.clone(), i));
         }
-        for (page, data) in self.doc_view.iter_mut().zip(pages) {
-            let sub_dirty = page.track_data(data);
-            dirty = dirty || sub_dirty;
+
+        // Get pages again for tracking (borrow ended above)
+        {
+            let pages = self.checkout_pages(kern);
+            for (idx, (page, data)) in self.doc_view.iter_mut().zip(pages).enumerate() {
+                let sub_dirty = page.track_data(data, layout_version);
+                web_sys::console::log_1(
+                    &format!(
+                        "[retrack_pages] Page {} track_data returned dirty={} (layout_version={})",
+                        idx, sub_dirty, layout_version
+                    )
+                    .into(),
+                );
+                dirty = dirty || sub_dirty;
+            }
         }
 
         // Populates the glyphs to dom so that they get rendered

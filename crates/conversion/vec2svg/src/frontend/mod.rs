@@ -317,6 +317,9 @@ impl<Feat: ExportFeature> SvgExporter<Feat> {
         }
 
         let mut t = SvgTask::<Feat>::default();
+        if let Some(parts) = parts.as_ref() {
+            t.debug_info_enabled = parts.source_map;
+        }
         let mut svg_body = vec![];
         t.render(module, pages, &mut svg_body);
         let patterns = t.render_patterns(module);
@@ -390,6 +393,8 @@ impl<Feat: ExportFeature> SvgExporter<Feat> {
 pub struct SvgTask<'a, Feat: ExportFeature> {
     /// A fingerprint builder for generating unique id.
     pub fingerprint_builder: FingerprintBuilder,
+    /// Whether to attach debug info at runtime.
+    pub debug_info_enabled: bool,
 
     /// Stores the style definitions used in the document.
     pub style_defs: StyleDefMap,
@@ -406,6 +411,7 @@ impl<Feat: ExportFeature> Default for SvgTask<'_, Feat> {
     fn default() -> Self {
         Self {
             fingerprint_builder: FingerprintBuilder::default(),
+            debug_info_enabled: true,
 
             style_defs: StyleDefMap::default(),
             gradients: PaintFillMap::default(),
@@ -443,7 +449,7 @@ impl<Feat: ExportFeature> SvgTask<'_, Feat> {
             gradients: &mut self.gradients,
             patterns: &mut self.patterns,
 
-            should_attach_debug_info: Feat::SHOULD_ATTACH_DEBUG_INFO,
+            should_attach_debug_info: Feat::SHOULD_ATTACH_DEBUG_INFO && self.debug_info_enabled,
             should_render_text_element: true,
             use_stable_glyph_id: true,
             should_rasterize_text: true,

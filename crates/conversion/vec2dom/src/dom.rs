@@ -34,6 +34,8 @@ pub struct DomPage {
     layout_data: Option<Page>,
     /// The next page data
     dirty_layout: Option<Page>,
+    /// Last seen layout version from the incremental client.
+    layout_version: u64,
     /// The viewport.
     viewport: ir::Rect,
     /// The BBox of the page.
@@ -75,6 +77,8 @@ impl DomPage {
 
         let me = tmpl.create_element(TEMPLATE);
         me.set_attribute("data-index", &idx.to_string()).unwrap();
+        // data-page is used by frontend hit-testing to locate page-local layout map entries.
+        let _ = me.set_attribute("data-page", &idx.to_string());
         let canvas: HtmlCanvasElement = me.first_element_child().unwrap().dyn_into().unwrap();
         let svg: SvgsvgElement = canvas.next_element_sibling().unwrap().dyn_into().unwrap();
         let semantics: HtmlDivElement = svg.next_element_sibling().unwrap().dyn_into().unwrap();
@@ -116,6 +120,7 @@ impl DomPage {
             bbox,
             layout_data: None,
             dirty_layout: None,
+            layout_version: 0,
             realized: Rc::new(Mutex::new(None)),
             realized_canvas: None,
             canvas_state: Rc::new(Mutex::new(None)),
@@ -123,23 +128,67 @@ impl DomPage {
         }
     }
 
-    pub fn track_data(&mut self, data: &Page) -> bool {
-        if self.layout_data.as_ref() == Some(data) {
+    pub fn track_data(&mut self, data: &Page, layout_version: u64) -> bool {
+        let is_same = self.layout_data.as_ref() == Some(data);
+        let is_same_version = self.layout_version == layout_version;
+
+        web_sys::console::log_1(
+            &format!(
+                "[track_data] page:{idx} is_same={is_same} same_version={same_version} layout_data_is_some={ld_some} data_content={data_content:?}",
+                idx = self.idx,
+                ld_some = self.layout_data.is_some(),
+                same_version = is_same_version,
+                data_content = data.content,
+            )
+            .into(),
+        );
+
+        if is_same && is_same_version {
             return false;
         }
 
         self.dirty_layout = Some(data.clone());
+        // Clear realized state to ensure re-render even if relayout is skipped
+        *self.realized.lock().unwrap() = None;
+        self.layout_version = layout_version;
+
+        web_sys::console::log_1(
+            &format!(
+                "[track_data] page:{idx} SET dirty_layout and cleared realized (layout_version={layout_version})",
+                idx = self.idx,
+            )
+            .into(),
+        );
+
         true
     }
 
     fn pull_viewport(&mut self, viewport: Option<tiny_skia::Rect>) {
         self.viewport = viewport
             .and_then(|viewport| {
+                // The viewport Y coordinates from TypeScript are in browser screen coordinates,
+                // not page-local coordinates. To ensure proper intersection with bbox (which is
+                // always in page-local coordinates starting at 0), we clamp the viewport Y values
+                // to the page's coordinate range. This ensures pages that are visible on screen
+                // (checked separately via inWindow) will properly render.
+                let page_height = self.bbox.hi.y.0;
+                let clamped_top = viewport.top().max(0.0).min(page_height);
+                let clamped_bottom = viewport.bottom().max(0.0).min(page_height);
+
+                // If after clamping the viewport has no height (page is off-screen according to
+                // the coordinates), use the full page as viewport since visibility is already
+                // checked via the inWindow flag in TypeScript.
+                let (final_top, final_bottom) = if clamped_bottom <= clamped_top {
+                    (0.0, page_height)
+                } else {
+                    (clamped_top, clamped_bottom)
+                };
+
                 tiny_skia::Rect::from_ltrb(
                     self.bbox.lo.x.0 - 1.,
-                    viewport.top(),
+                    final_top,
                     self.bbox.hi.x.0 + 1.,
-                    viewport.bottom(),
+                    final_bottom,
                 )
             })
             .map(From::from)
@@ -178,12 +227,31 @@ impl DomPage {
         }
     }
 
-    pub fn relayout(&mut self, ctx: &CanvasBackend) -> Result<()> {
-        if let Some(data) = self.dirty_layout.take() {
-            self.do_relayout(ctx, data)?
-        }
+    /// Returns true if layout work was performed (dirty_layout was present)
+    pub fn relayout(&mut self, ctx: &CanvasBackend) -> Result<bool> {
+        let has_dirty = self.dirty_layout.is_some();
+        web_sys::console::log_1(
+            &format!(
+                "[relayout] page:{idx} has_dirty_layout={has_dirty}",
+                idx = self.idx,
+            )
+            .into(),
+        );
 
-        Ok(())
+        if let Some(data) = self.dirty_layout.take() {
+            web_sys::console::log_1(
+                &format!(
+                    "[relayout] page:{} calling do_relayout with data.content={:?}",
+                    self.idx,
+                    data.content,
+                )
+                .into(),
+            );
+            self.do_relayout(ctx, data)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn do_relayout(&mut self, ctx: &CanvasBackend, data: Page) -> Result<()> {
@@ -269,21 +337,37 @@ impl DomPage {
     pub fn need_repaint_svg(&mut self, viewport: Option<tiny_skia::Rect>) -> bool {
         self.pull_viewport(viewport);
 
-        let should_visible = !self.bbox.intersect(&self.viewport).is_empty();
+        let intersection = self.bbox.intersect(&self.viewport);
+        let should_visible = !intersection.is_empty();
+        // Check if we actually need to do rendering work:
+        // - dirty_layout means data changed and needs processing
+        // - realized.is_none() means SVG elements need to be created
+        let has_dirty_layout = self.dirty_layout.is_some();
+        let realized_is_none = self.realized.lock().unwrap().is_none();
+        let needs_render = has_dirty_layout || realized_is_none;
 
-        if cfg!(feature = "debug_repaint_svg") {
-            web_sys::console::log_1(
-                &format!(
-                    "need_repaint_svg({should_visible}) bbox:{bbox:?} view:{viewport:?}",
-                    bbox = self.bbox,
-                    viewport = self.viewport,
-                )
-                .into(),
-            );
-        }
+        // Always log for debugging
+        web_sys::console::log_1(
+            &format!(
+                "[need_repaint_svg] page:{idx} bbox=({bx1:.1},{by1:.1})-({bx2:.1},{by2:.1}) viewport=({vx1:.1},{vy1:.1})-({vx2:.1},{vy2:.1}) intersection_empty={int_empty} visible:{should_visible} dirty:{has_dirty_layout} realized_none:{realized_is_none} -> needs_render:{needs_render} result:{result}",
+                idx = self.idx,
+                bx1 = self.bbox.lo.x.0,
+                by1 = self.bbox.lo.y.0,
+                bx2 = self.bbox.hi.x.0,
+                by2 = self.bbox.hi.y.0,
+                vx1 = self.viewport.lo.x.0,
+                vy1 = self.viewport.lo.y.0,
+                vx2 = self.viewport.hi.x.0,
+                vy2 = self.viewport.hi.y.0,
+                int_empty = intersection.is_empty(),
+                result = should_visible && needs_render,
+            )
+            .into(),
+        );
 
         self.change_svg_visibility(should_visible);
-        should_visible
+        // Only repaint if visible AND there's actual work to do
+        should_visible && needs_render
     }
 
     pub fn repaint_svg(&mut self, ctx: &mut DomContext<'_, '_>) -> Result<()> {

@@ -1,15 +1,17 @@
 use std::{
     borrow::Cow,
+    cell::RefCell,
+    collections::HashMap,
     hash::Hash,
-    ops::DerefMut,
     sync::{atomic::AtomicU64, Arc},
 };
 
-use parking_lot::Mutex;
+use rayon::current_thread_index;
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelExtend,
     ParallelIterator,
 };
+use parking_lot::Mutex;
 
 use reflexo::typst::{TypstDocument, TypstHtmlDocument, TypstPagedDocument};
 use reflexo::ImmutStr;
@@ -18,8 +20,8 @@ use typst::{
     foundations::{Bytes, Smart},
     introspection::{Introspector, Tag},
     layout::{
-        Abs as TypstAbs, Axes, Dir, Frame, FrameItem, FrameKind, Position, Ratio as TypstRatio,
-        Size as TypstSize, Transform as TypstTransform,
+        Abs as TypstAbs, Axes, Dir, Frame, FrameItem, FrameKind, Point as TypstPoint,
+        Position, Ratio as TypstRatio, Size as TypstSize, Transform as TypstTransform,
     },
     model::Destination,
     syntax::Span,
@@ -30,11 +32,15 @@ use typst::{
     },
 };
 use typst_html::{HtmlElement, HtmlNode};
+use tiny_skia_path::Transform as SkTransform;
 
 use crate::{
     convert::ImageExt,
     font::GlyphProvider,
     hash::{Fingerprint, FingerprintBuilder},
+    layout::{
+        inflate_rect_by_stroke, PageGlyphPositions, PageLayout, SpanBBox, SpanGlyphPositions,
+    },
     ir::{self, *},
     path2d::SvgPath2DBuilder,
     utils::{AbsExt, ToCssExt},
@@ -45,6 +51,135 @@ use super::{SourceNodeKind, SourceRegion, Span2VecPass, TGlyph2VecPass};
 
 // todo: we need to remove this magic size
 pub const PAGELESS_SIZE: ir::Size = Size::new(Scalar(1e2 + 4.1234567), Scalar(1e3 + 4.1234567));
+
+thread_local! {
+    static TEXT_GLYPH_BUF: RefCell<Vec<(Axes<Abs>, Axes<Abs>, u32)>> = RefCell::new(Vec::new());
+    static PATH_STYLE_BUF: RefCell<Vec<PathStyle>> = RefCell::new(Vec::new());
+}
+
+struct LayoutCollector {
+    spans: Mutex<HashMap<u64, Rect>>,
+    glyphs: Mutex<HashMap<u64, GlyphRun>>,
+}
+
+impl Default for LayoutCollector {
+    fn default() -> Self {
+        Self {
+            spans: Mutex::new(HashMap::new()),
+            glyphs: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[derive(Default)]
+struct GlyphRun {
+    positions: Vec<f32>,
+    glyph_spans: Vec<u64>,
+    dir_rtl: bool,
+}
+
+impl LayoutCollector {
+    fn record_span(&self, span: u64, rect: Rect, transform: Transform) {
+        if span == 0 || rect.is_empty() {
+            return;
+        }
+
+        let world = transform_rect(rect, transform).cano();
+        if world.is_empty() {
+            return;
+        }
+
+        let mut spans = self.spans.lock();
+        spans
+            .entry(span)
+            .and_modify(|existing| *existing = existing.union(&world))
+            .or_insert(world);
+    }
+
+    fn record_glyph_positions(
+        &self,
+        span: u64,
+        positions: Vec<f32>,
+        glyph_spans: Vec<u64>,
+        dir_rtl: bool,
+    ) {
+        if span == 0 || positions.is_empty() {
+            return;
+        }
+        let mut glyphs = self.glyphs.lock();
+        glyphs.insert(
+            span,
+            GlyphRun {
+                positions,
+                glyph_spans,
+                dir_rtl,
+            },
+        );
+    }
+
+    fn to_page_layout(&self, page: u32) -> PageLayout {
+        let spans = self
+            .spans
+            .lock()
+            .iter()
+            .map(|(span, rect)| SpanBBox {
+                span: *span,
+                x: rect.left().0,
+                y: rect.top().0,
+                width: rect.width().0,
+                height: rect.height().0,
+            })
+            .collect();
+
+        PageLayout { page, spans }
+    }
+
+    fn to_page_glyph_map(&self, page: u32) -> PageGlyphPositions {
+        let spans = self
+            .glyphs
+            .lock()
+            .iter()
+            .map(|(span, run)| SpanGlyphPositions {
+                span: *span,
+                positions: run.positions.clone(),
+                glyph_spans: run.glyph_spans.clone(),
+                dir_rtl: run.dir_rtl,
+            })
+            .collect();
+
+        PageGlyphPositions { page, spans }
+    }
+}
+
+fn rect_from_size(size: Axes<TypstAbs>) -> Rect {
+    Rect {
+        lo: Point::new(Scalar(0.), Scalar(0.)),
+        hi: Point::new(Scalar(size.x.to_f32()), Scalar(size.y.to_f32())),
+    }
+}
+
+fn transform_rect(rect: Rect, transform: Transform) -> Rect {
+    let ts: SkTransform = transform.into();
+    let mut corners = [
+        tiny_skia_path::Point::from(rect.lo),
+        tiny_skia_path::Point::from(Point::new(rect.hi.x, rect.lo.y)),
+        tiny_skia_path::Point::from(Point::new(rect.lo.x, rect.hi.y)),
+        tiny_skia_path::Point::from(rect.hi),
+    ];
+
+    ts.map_points(&mut corners);
+
+    tiny_skia_path::Rect::from_points(&corners)
+        .map(From::from)
+        .unwrap_or_else(Rect::empty)
+}
+
+fn transform_point(point: Point, transform: Transform) -> Point {
+    let ts: SkTransform = transform.into();
+    let mut p = [tiny_skia_path::Point::from(point)];
+    ts.map_points(&mut p);
+    Point::from(p[0])
+}
 
 #[derive(Clone, Copy)]
 struct State<'a> {
@@ -113,7 +248,7 @@ pub struct Typst2VecPassImpl<const ENABLE_REF_CNT: bool = false> {
     pub spans: Span2VecPass,
     pub cache_items: RefItemMapT<(AtomicU64, Fingerprint, VecItem)>,
     pub items: RefItemMapSync,
-    pub new_items: Mutex<Vec<(Fingerprint, VecItem)>>,
+    pub new_items: Vec<Mutex<Vec<(Fingerprint, VecItem)>>>,
 
     pub command_executor: Arc<dyn CommandExecutor + Send + Sync>,
 
@@ -130,13 +265,19 @@ impl<const ENABLE_REF_CNT: bool> Default for Typst2VecPassImpl<ENABLE_REF_CNT> {
         let glyphs = TGlyph2VecPass::new(GlyphProvider::default(), true);
         let spans = Span2VecPass::default();
 
+        const NEW_ITEM_SHARDS: usize = 32;
+
+        let new_items = (0..NEW_ITEM_SHARDS)
+            .map(|_| Mutex::new(Vec::new()))
+            .collect();
+
         Self {
             lifetime: 0,
             glyphs,
             spans,
             cache_items: Default::default(),
             items: Default::default(),
-            new_items: Default::default(),
+            new_items,
             fingerprint_builder: Default::default(),
             command_executor: Arc::new(()),
         }
@@ -183,7 +324,7 @@ impl Typst2VecPass {
                 }
             }
             VecItem::Group(g) => {
-                for (_, id) in g.0.iter() {
+                for (_, id) in g.items.iter() {
                     if !self.items.contains_key(id) {
                         self.intern(m, id);
                     }
@@ -237,14 +378,20 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         }
     }
 
-    pub fn doc(&self, doc: &TypstDocument) -> Vec<Page> {
+    pub fn doc(
+        &self,
+        doc: &TypstDocument,
+    ) -> (Vec<Page>, Vec<PageLayout>, Vec<PageGlyphPositions>) {
         match doc {
             TypstDocument::Html(doc) => self.html(doc),
             TypstDocument::Paged(doc) => self.paged(doc),
         }
     }
 
-    pub fn html(&self, doc: &TypstHtmlDocument) -> Vec<Page> {
+    pub fn html(
+        &self,
+        doc: &TypstHtmlDocument,
+    ) -> (Vec<Page>, Vec<PageLayout>, Vec<PageGlyphPositions>) {
         let doc_reg = self.spans.start();
 
         let page_reg = self.spans.start();
@@ -270,21 +417,37 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             .doc_region
             .store(doc_reg, std::sync::atomic::Ordering::SeqCst);
 
-        vec![root]
+        (vec![root], vec![], vec![])
     }
 
-    pub fn paged(&self, doc: &TypstPagedDocument) -> Vec<Page> {
+    pub fn paged(
+        &self,
+        doc: &TypstPagedDocument,
+    ) -> (
+        Vec<Page>,
+        Vec<PageLayout>,
+        Vec<PageGlyphPositions>,
+    ) {
         let doc_reg = self.spans.start();
 
-        let pages = doc
+        let results: Vec<(Page, PageLayout, PageGlyphPositions)> = doc
             .pages
             .par_iter()
             .enumerate()
             .map(|(idx, p)| {
                 let page_reg = self.spans.start();
+                let layout = Arc::new(LayoutCollector::default());
 
                 let state = State::new(&doc.introspector, p.frame.size().into_typst());
-                let abs_ref = self.frame_(state, &p.frame, page_reg, idx, p.fill_or_transparent());
+                let abs_ref = self.frame_(
+                    state,
+                    &p.frame,
+                    page_reg,
+                    idx,
+                    p.fill_or_transparent(),
+                    None,
+                    Some(layout.clone()),
+                );
 
                 self.spans.push_span(SourceRegion {
                     region: doc_reg,
@@ -293,10 +456,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                     item: abs_ref,
                 });
 
-                Page {
-                    content: abs_ref,
-                    size: p.frame.size().into_typst(),
-                }
+                (
+                    Page {
+                        content: abs_ref,
+                        size: p.frame.size().into_typst(),
+                    },
+                    layout.to_page_layout(idx as u32),
+                    layout.to_page_glyph_map(idx as u32),
+                )
             })
             .collect();
 
@@ -304,11 +471,29 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             .doc_region
             .store(doc_reg, std::sync::atomic::Ordering::SeqCst);
 
-        pages
+        let (pages, layout_map, glyph_map) =
+            results
+                .into_iter()
+                .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, (p, l, g)| {
+                    acc.0.push(p);
+                    acc.1.push(l);
+                    acc.2.push(g);
+                    acc
+                });
+
+        (pages, layout_map, glyph_map)
     }
 
-    fn frame(&self, state: State, frame: &Frame, parent: usize, index: usize) -> Fingerprint {
-        self.frame_(state, frame, parent, index, None)
+    fn frame(
+        &self,
+        state: State,
+        frame: &Frame,
+        parent: usize,
+        index: usize,
+        span: Option<Span>,
+        layout: Option<Arc<LayoutCollector>>,
+    ) -> Fingerprint {
+        self.frame_(state, frame, parent, index, None, span, layout)
     }
 
     fn frame_(
@@ -318,6 +503,8 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         parent: usize,
         index: usize,
         fill: Option<Paint>,
+        span: Option<Span>,
+        layout: Option<Arc<LayoutCollector>>,
     ) -> Fingerprint {
         let src_reg = self.spans.start();
 
@@ -356,11 +543,12 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             let idx = fill_adjust + idx;
             let mut is_link = false;
             let state = state.pre_translate((*pos).into_typst());
+            let layout = layout.clone();
             let item = match item {
                 FrameItem::Group(group) => {
                     let state = state.pre_concat(group.transform.into_typst());
 
-                    let mut inner = self.frame(state, &group.frame, src_reg, idx);
+                    let mut inner = self.frame(state, &group.frame, src_reg, idx, None, layout);
 
                     if let Some(p) = group.clip.as_ref() {
                         // todo: merge
@@ -431,6 +619,108 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         item: i,
                     });
 
+                    if let Some(layout) = &layout {
+                        // Compute per-span bounds and glyph x positions (page space).
+                        let dir_rtl = false;
+                        let mut cursor = TypstPoint::zero();
+                        let mut per_span_bounds: HashMap<u64, Rect> = HashMap::new();
+                        let mut per_span_glyphs: HashMap<u64, (Vec<f32>, Vec<u64>, Option<f32>)> =
+                            HashMap::new();
+
+                        for glyph in &text.glyphs {
+                            let advance = TypstPoint::new(
+                                glyph.x_advance.at(text.size),
+                                glyph.y_advance.at(text.size),
+                            );
+                            let offset = TypstPoint::new(
+                                glyph.x_offset.at(text.size),
+                                glyph.y_offset.at(text.size),
+                            );
+
+                            let id = glyph.span.0.into_raw().get();
+
+                            if let Some(bb) =
+                                text.font.ttf().glyph_bounding_box(ttf_parser::GlyphId(glyph.id))
+                            {
+                                let pos = cursor + offset;
+                                let a = pos
+                                    + TypstPoint::new(
+                                        text.font.to_em(bb.x_min).at(text.size),
+                                        text.font.to_em(bb.y_min).at(text.size),
+                                    );
+                                let b = pos
+                                    + TypstPoint::new(
+                                        text.font.to_em(bb.x_max).at(text.size),
+                                        text.font.to_em(bb.y_max).at(text.size),
+                                    );
+
+                                // Convert glyph box to frame coordinates (y-down).
+                                let min_x = a.x.min(b.x).to_pt() as f32;
+                                let max_x = a.x.max(b.x).to_pt() as f32;
+                                let mut min_y = -(a.y.max(b.y)).to_pt() as f32;
+                                let mut max_y = -(a.y.min(b.y)).to_pt() as f32;
+                                if min_y > max_y {
+                                    std::mem::swap(&mut min_y, &mut max_y);
+                                }
+
+                                let mut rect = Rect {
+                                    lo: Point::new(Scalar(min_x), Scalar(min_y)),
+                                    hi: Point::new(Scalar(max_x), Scalar(max_y)),
+                                };
+
+                                if let Some(stroke) = text.stroke.as_ref() {
+                                    rect = inflate_rect_by_stroke(rect, stroke);
+                                }
+
+                                if id != 0 {
+                                    per_span_bounds
+                                        .entry(id)
+                                        .and_modify(|existing| *existing = existing.union(&rect))
+                                        .or_insert(rect);
+                                }
+                            }
+
+                            if id != 0 {
+                                let start = cursor + offset;
+                                let end = start + advance;
+                                let start_point = transform_point(
+                                    Point::new(
+                                        Scalar(start.x.to_pt() as f32),
+                                        Scalar(-(start.y.to_pt() as f32)),
+                                    ),
+                                    state.transform,
+                                );
+                                let end_point = transform_point(
+                                    Point::new(
+                                        Scalar(end.x.to_pt() as f32),
+                                        Scalar(-(end.y.to_pt() as f32)),
+                                    ),
+                                    state.transform,
+                                );
+
+                                let entry = per_span_glyphs
+                                    .entry(id)
+                                    .or_insert_with(|| (Vec::new(), Vec::new(), None));
+                                entry.0.push(start_point.x.0);
+                                entry.1.push(id);
+                                entry.2 = Some(end_point.x.0);
+                            }
+
+                            cursor += advance;
+                        }
+
+                        for (id, rect) in per_span_bounds {
+                            layout.record_span(id, rect, state.transform);
+                        }
+
+                        for (id, (mut positions, glyph_spans, last_end)) in per_span_glyphs {
+                            if let Some(end_x) = last_end {
+                                positions.push(end_x);
+                            }
+                            layout.record_glyph_positions(id, positions, glyph_spans, dir_rtl);
+                        }
+                    }
+
                     i
                 }
                 FrameItem::Shape(shape, s) => {
@@ -444,6 +734,25 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         item: i,
                     });
 
+                    if let Some(layout) = &layout {
+                        let mut rect = rect_from_size(shape.geometry.bbox_size());
+                        if let Some(stroke) = &shape.stroke {
+                            rect = inflate_rect_by_stroke(rect, stroke);
+                        }
+
+                        if rect.is_empty() {
+                            // Keep a minimal footprint so zero-sized shapes still register.
+                            let epsilon = Scalar(1.0);
+                            rect.hi.x = rect.hi.x.max(rect.lo.x + epsilon);
+                            rect.hi.y = rect.hi.y.max(rect.lo.y + epsilon);
+                        }
+
+                        let id = s.into_raw().get();
+                        if id != 0 {
+                            layout.record_span(id, rect, state.transform);
+                        }
+                    }
+
                     i
                 }
                 FrameItem::Image(image, size, s) => {
@@ -455,6 +764,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         kind: SourceNodeKind::Image(*s),
                         item: i,
                     });
+
+                    if let Some(layout) = &layout {
+                        let rect = rect_from_size(*size);
+                        let id = s.into_raw().get();
+                        if id != 0 {
+                            layout.record_span(id, rect, state.transform);
+                        }
+                    }
 
                     i
                 }
@@ -486,22 +803,19 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         });
         items.par_extend(items_iter);
 
-        // swap link items
-        items.sort_by(|x, y| {
-            let x_is_link = x.1;
-            let y_is_link = y.1;
-            if x_is_link || y_is_link {
-                if x_is_link && y_is_link {
-                    return std::cmp::Ordering::Equal;
-                } else if x_is_link {
-                    return std::cmp::Ordering::Greater;
+        if items.len() > 1 {
+            let mut links = Vec::new();
+            let mut non_links = Vec::with_capacity(items.len());
+            for item in items.drain(..) {
+                if item.1 {
+                    links.push(item);
                 } else {
-                    return std::cmp::Ordering::Less;
+                    non_links.push(item);
                 }
             }
-
-            std::cmp::Ordering::Equal
-        });
+            non_links.extend(links.into_iter());
+            items = non_links;
+        }
 
         #[cfg(not(feature = "no-content-hint"))]
         {
@@ -512,9 +826,10 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             }
         }
 
-        let g = self.store(VecItem::Group(GroupRef(
-            items.into_iter().map(|(x, _, y)| (x, y)).collect(),
-        )));
+        let g = self.store(VecItem::Group(GroupRef {
+            items: Arc::from_iter(items.into_iter().map(|(x, _, y)| (x, y))),
+            span_id: span.map(|s| s.into_raw().get()),
+        }));
 
         self.spans.push_span(SourceRegion {
             region: parent,
@@ -562,24 +877,37 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     }
 
     fn insert_if(&self, cond: Fingerprint, f: impl FnOnce() -> VecItem) -> Fingerprint {
+        // Fast-path lookup using the precomputed condition fingerprint.
         let shard = &self.cache_items.shard(cond);
-        let shard_read = shard.read();
-        if let Some(pos) = shard_read.get(&cond) {
+        if let Some(pos) = shard.read().get(&cond) {
             self.increase_lifetime_for_item(&pos.0);
             self.insert(pos.1, Cow::Borrowed(&pos.2));
             return pos.1;
         }
 
-        drop(shard_read);
-
+        // Cache miss: build the item and compute its true fingerprint.
         let item = f();
         let flat_fg = self.fingerprint_builder.resolve(&item);
+
+        // If the computed fingerprint differs from the condition fingerprint
+        // (e.g., size clamping for degenerate shapes), try a second lookup
+        // using the real fingerprint before inserting a duplicate.
+        if flat_fg != cond {
+            let shard = &self.cache_items.shard(flat_fg);
+            if let Some(pos) = shard.read().get(&flat_fg) {
+                self.increase_lifetime_for_item(&pos.0);
+                self.insert(pos.1, Cow::Borrowed(&pos.2));
+                return pos.1;
+            }
+        }
+
+        let shard = &self.cache_items.shard(flat_fg);
         self.insert(flat_fg, Cow::Borrowed(&item));
 
         {
             let mut shard_write = shard.write();
             shard_write.insert(
-                cond,
+                flat_fg,
                 if ENABLE_REF_CNT {
                     (AtomicU64::new(self.lifetime), flat_fg, item)
                 } else {
@@ -600,7 +928,8 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         }
 
         let item_resolution = if ENABLE_REF_CNT {
-            self.new_items.lock().push((fg, item.into_owned()));
+            let idx = current_thread_index().unwrap_or(0) % self.new_items.len();
+            self.new_items[idx].lock().push((fg, item.into_owned()));
             (AtomicU64::new(self.lifetime), VecItem::None)
         } else {
             (AtomicU64::new(0), item.into_owned())
@@ -610,55 +939,6 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         let mut shard_write = shard.write();
         shard_write.insert(fg, item_resolution);
         false
-    }
-
-    #[cfg(feature = "item-dashmap")]
-    fn insert_if(&self, cond: Fingerprint, f: impl FnOnce() -> VecItem) -> Fingerprint {
-        use dashmap::mapref::entry::Entry::*;
-        match self.cache_items.entry(cond) {
-            Occupied(pos) => {
-                let pos = pos.into_ref();
-                self.increase_lifetime(&pos.0);
-                self.insert(pos.1, Cow::Borrowed(&pos.2));
-                pos.1
-            }
-            Vacant(pos) => {
-                let item = f();
-                let flat_fg = self.fingerprint_builder.resolve(&item);
-                self.insert(flat_fg, Cow::Borrowed(&item));
-
-                pos.insert(if ENABLE_REF_CNT {
-                    (AtomicU64::new(self.lifetime), flat_fg, item)
-                } else {
-                    (AtomicU64::new(0), flat_fg, item)
-                });
-
-                flat_fg
-            }
-        }
-    }
-
-    #[cfg(feature = "item-dashmap")]
-    fn insert(&self, fg: Fingerprint, item: Cow<VecItem>) -> bool {
-        use dashmap::mapref::entry::Entry::*;
-        match self.items.entry(fg) {
-            Occupied(pos) => {
-                let pos = pos.into_ref();
-                self.increase_lifetime(&pos.0);
-                true
-            }
-            Vacant(pos) => {
-                let item_resolution = if ENABLE_REF_CNT {
-                    self.new_items.lock().push((fg, item.into_owned()));
-                    (AtomicU64::new(self.lifetime), VecItem::None)
-                } else {
-                    (AtomicU64::new(0), item.into_owned())
-                };
-
-                pos.insert(item_resolution);
-                false
-            }
-        }
     }
 
     /// Convert a text into vector item.
@@ -680,12 +960,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
 
         #[derive(Hash)]
         struct TextHashKey<'i> {
+            tag: u8,
             stateful_fill: Option<Arc<str>>,
             stateful_stroke: Option<Arc<str>>,
             text: &'i TypstTextItem,
         }
 
         let cond = TextHashKey {
+            tag: 1,
             stateful_fill: stateful_fill.clone(),
             stateful_stroke: stateful_stroke.clone(),
             text,
@@ -703,49 +985,60 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         self.store_cached(&cond, || {
             let font = self.glyphs.build_font(&text.font);
 
-            let mut glyphs = Vec::with_capacity(text.glyphs.len());
-            for glyph in &text.glyphs {
-                self.glyphs
-                    .build_glyph(font, GlyphItem::Raw(text.font.clone(), GlyphId(glyph.id)));
-                glyphs.push((
-                    Axes::<Abs> {
-                        x: glyph.x_offset.at(text.size).into_typst(),
-                        y: glyph.y_offset.at(text.size).into_typst(),
-                    },
-                    Axes::<Abs> {
-                        x: glyph.x_advance.at(text.size).into_typst(),
-                        y: glyph.y_advance.at(text.size).into_typst(),
-                    },
-                    glyph.id as u32,
-                ));
-            }
+            let glyphs = TEXT_GLYPH_BUF.with(|buf| {
+                let mut glyphs = buf.borrow_mut();
+                glyphs.clear();
+                glyphs.reserve(text.glyphs.len());
+                for glyph in &text.glyphs {
+                    self.glyphs
+                        .build_glyph(font, GlyphItem::Raw(text.font.clone(), GlyphId(glyph.id)));
+                    glyphs.push((
+                        Axes::<Abs> {
+                            x: glyph.x_offset.at(text.size).into_typst(),
+                            y: glyph.y_offset.at(text.size).into_typst(),
+                        },
+                        Axes::<Abs> {
+                            x: glyph.x_advance.at(text.size).into_typst(),
+                            y: glyph.y_advance.at(text.size).into_typst(),
+                        },
+                        glyph.id as u32,
+                    ));
+                }
+                Arc::from_iter(glyphs.iter().map(|(offset, advance, glyph_id)| {
+                    (
+                        crate::ir::Axes {
+                            x: Scalar(offset.x.0),
+                            y: Scalar(offset.y.0),
+                        },
+                        crate::ir::Axes {
+                            x: Scalar(advance.x.0),
+                            y: Scalar(advance.y.0),
+                        },
+                        *glyph_id,
+                    )
+                }))
+            });
 
             let glyph_chars: String = text.text.to_string();
             // let mut extras = ExtraSvgItems::default();
 
             let font = self.glyphs.build_font(&text.font);
 
-            let mut styles = vec![PathStyle::Fill(stateful_fill())];
-            if let Some(stroke) = text.stroke.as_ref() {
-                self.stroke(stateful_stroke, stroke, &mut styles);
-            }
+            let styles = PATH_STYLE_BUF.with(|buf| {
+                let mut styles = buf.borrow_mut();
+                styles.clear();
+                styles.push(PathStyle::Fill(stateful_fill()));
+                if let Some(stroke) = text.stroke.as_ref() {
+                    self.stroke(stateful_stroke, stroke, &mut styles);
+                }
+                styles.drain(..).collect::<Vec<_>>()
+            });
 
             VecItem::Text(TextItem {
                 content: Arc::new(TextItemContent {
                     content: glyph_chars.into(),
-                    glyphs: Arc::from_iter(glyphs.iter().map(|(offset, advance, glyph_id)| {
-                        (
-                            crate::ir::Axes {
-                                x: Scalar(offset.x.0),
-                                y: Scalar(offset.y.0),
-                            },
-                            crate::ir::Axes {
-                                x: Scalar(advance.x.0),
-                                y: Scalar(advance.y.0),
-                            },
-                            *glyph_id,
-                        )
-                    })),
+                    glyphs,
+                    span_id: text.glyphs.first().map(|g| g.span.0.into_raw().get()),
                 }),
                 shape: Arc::new(TextShape {
                     font,
@@ -804,6 +1097,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     fn shape(&self, state: State, shape: &Shape) -> Fingerprint {
         #[derive(Hash)]
         struct ShapeKey<'i> {
+            tag: u8,
             stateful_fill: Option<Arc<str>>,
             stateful_stroke: Option<Arc<str>>,
             shape: &'i Shape,
@@ -825,6 +1119,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         };
 
         let cond = &ShapeKey {
+            tag: 2,
             stateful_fill: stateful_fill.clone(),
             stateful_stroke: stateful_stroke.clone(),
             shape,
@@ -883,22 +1178,29 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
 
             let d = builder.0.into();
 
-            let mut styles = Vec::new();
+            let styles = PATH_STYLE_BUF.with(|buf| {
+                let mut styles = buf.borrow_mut();
+                styles.clear();
 
-            if let Some(paint_fill) = &shape.fill {
-                styles.push(PathStyle::Fill(
-                    stateful_fill.unwrap_or_else(|| self.paint_shape(state, shape, paint_fill)),
-                ));
-            }
+                if let Some(paint_fill) = &shape.fill {
+                    styles.push(PathStyle::Fill(
+                        stateful_fill.unwrap_or_else(|| {
+                            self.paint_shape(state, shape, paint_fill)
+                        }),
+                    ));
+                }
 
-            if let Some(stroke) = &shape.stroke {
-                self.stroke(stateful_stroke, stroke, &mut styles);
-            }
+                if let Some(stroke) = &shape.stroke {
+                    self.stroke(stateful_stroke, stroke, &mut styles);
+                }
 
-            match shape.fill_rule {
-                FillRule::NonZero => styles.push(PathStyle::FillRule("nonzero".into())),
-                FillRule::EvenOdd => styles.push(PathStyle::FillRule("evenodd".into())),
-            }
+                match shape.fill_rule {
+                    FillRule::NonZero => styles.push(PathStyle::FillRule("nonzero".into())),
+                    FillRule::EvenOdd => styles.push(PathStyle::FillRule("evenodd".into())),
+                }
+
+                styles.drain(..).collect::<Vec<_>>()
+            });
 
             let mut shape_size = shape.geometry.bbox_size();
             // Edge cases for strokes.
@@ -923,11 +1225,16 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     pub fn image(&self, image: &TypstImage, size: Axes<TypstAbs>) -> Fingerprint {
         #[derive(Hash)]
         struct ImageKey<'i> {
+            tag: u8,
             image: &'i TypstImage,
             size: Axes<TypstAbs>,
         }
 
-        let cond = ImageKey { image, size };
+        let cond = ImageKey {
+            tag: 3,
+            image,
+            size,
+        };
 
         self.store_cached(&cond, || {
             if matches!(image.alt(), Some("!typst-embed-command")) {
@@ -1118,7 +1425,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     }
 
     fn pattern(&self, state: State, g: &Tiling, transform: ir::Transform) -> Fingerprint {
-        let frame = self.frame(state, g.frame(), 0, 0);
+        let frame = self.frame(state, g.frame(), 0, 0, None, None);
 
         let item = self.store(VecItem::Pattern(Arc::new(PatternItem {
             frame,
@@ -1155,7 +1462,9 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         match child {
                             HtmlNode::Tag(..) => continue,
                             HtmlNode::Frame(e) => {
-                                HtmlChildren::Item(self.frame(state, &e.inner, parent, index))
+                                HtmlChildren::Item(
+                                    self.frame(state, &e.inner, parent, index, None, None),
+                                )
                             }
                             HtmlNode::Element(e) => {
                                 HtmlChildren::Item(self.html_element(state, e, parent, index))
@@ -1179,7 +1488,9 @@ impl IncrTypst2VecPass {
     /// Assuming that the old lifetime is 'l,
     /// the retained and new lifetime will be 'l + 1 and 'l + 2, respectively.
     pub fn increment_lifetime(&mut self) {
-        self.new_items.get_mut().clear();
+        for shard in &self.new_items {
+            shard.lock().clear();
+        }
         self.glyphs.new_fonts.get_mut().clear();
         self.glyphs.new_glyphs.get_mut().clear();
         self.lifetime += 2;
@@ -1188,22 +1499,30 @@ impl IncrTypst2VecPass {
 
     /// Perform garbage collection with given threshold.
     pub fn gc(&mut self, threshold: u64) -> Vec<Fingerprint> {
-        let gc_items = Arc::new(Mutex::new(vec![]));
-
         // a threshold is set by current lifetime subtracted by the given threshold.
         // It uses saturating_sub to prevent underflow (u64).
         let gc_threshold = self.lifetime.saturating_sub(threshold);
 
-        self.items.as_mut_slice().par_iter_mut().for_each(|e| {
-            e.get_mut().retain(|k, v| {
-                if v.0.load(std::sync::atomic::Ordering::Relaxed) < gc_threshold {
-                    gc_items.lock().push(*k);
-                    false
-                } else {
-                    true
-                }
+        let gc_items = self
+            .items
+            .as_mut_slice()
+            .par_iter_mut()
+            .map(|e| {
+                let mut local = Vec::new();
+                e.get_mut().retain(|k, v| {
+                    if v.0.load(std::sync::atomic::Ordering::Relaxed) < gc_threshold {
+                        local.push(*k);
+                        false
+                    } else {
+                        true
+                    }
+                });
+                local
+            })
+            .reduce(Vec::new, |mut acc, mut local| {
+                acc.append(&mut local);
+                acc
             });
-        });
 
         // Same as above
         let cache_threshold = self.lifetime.saturating_sub(threshold);
@@ -1216,7 +1535,13 @@ impl IncrTypst2VecPass {
                 });
             });
 
-        Arc::try_unwrap(gc_items).unwrap().into_inner()
+        gc_items
+    }
+
+    /// Return approximate item count across shards (used for GC heuristics).
+    pub fn items_len(&self) -> usize {
+        self.items
+            .shards_len()
     }
 
     /// Finalize modules containing new vector items.
@@ -1225,7 +1550,12 @@ impl IncrTypst2VecPass {
         let (fonts, glyphs) = self.glyphs.finalize_delta();
 
         // filter items by lifetime
-        let items = { ItemMap::from_iter(std::mem::take(self.new_items.lock().deref_mut())) };
+        let mut flat = Vec::new();
+        for shard in &self.new_items {
+            let mut guard = shard.lock();
+            flat.extend(guard.drain(..));
+        }
+        let items = ItemMap::from_iter(flat);
 
         Module {
             fonts,

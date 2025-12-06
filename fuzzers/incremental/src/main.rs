@@ -78,7 +78,7 @@ pub fn test_compiler(workspace_dir: &Path, entry_file_path: &Path) {
             .unwrap();
 
         let delta = incr_server.pack_delta(&TypstDocument::Paged(doc));
-        let delta = BytesModuleStream::from_slice(&delta).checkout_owned();
+        let delta = BytesModuleStream::from_slice(&delta.bytes).checkout_owned();
         incr_client.merge_delta(delta);
         incr_client.set_layout(incr_client.doc.layouts[0].unwrap_single());
         let _ = incr_svg_client.render_in_window(&mut incr_client, window);

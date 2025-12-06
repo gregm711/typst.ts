@@ -9,13 +9,13 @@
     "Typst"
   ],
   "type": "module",
-  "module": "./pkg/wasm-pack-shim.mjs",
-  "require": "./pkg/wasm-pack-shim.mjs",
+  "module": "./pkg/typst_ts_renderer.js",
+  "require": "./pkg/typst_ts_renderer.js",
   "types": "./pkg/typst_ts_renderer.d.ts",
   "exports": {
     ".": {
       "types": "./pkg/typst_ts_renderer.d.ts",
-      "default": "./pkg/wasm-pack-shim.mjs"
+      "default": "./pkg/typst_ts_renderer.js"
     },
     "./wasm": {
       "types": "./pkg/typst_ts_renderer_bg.wasm.d.ts",

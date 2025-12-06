@@ -2,7 +2,7 @@ export const kObject = Symbol.for('reflexo-obj');
 
 /**
  * The page information of a Typst document.
- * @property {number} pageOffset - The offset of the page.
+ * @property {number} pageOffset - Cumulative offset from the document origin (pt).
  * @property {number} width - The width of the page in pt.
  * @property {number} height - The height of the page in pt.
  */

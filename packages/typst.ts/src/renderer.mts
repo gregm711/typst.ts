@@ -147,13 +147,15 @@ export class RenderSession {
     const pages_info = this[kObject].pages_info;
     const pageInfos: PageInfo[] = [];
     const pageCount = pages_info.page_count;
+    let cumulativeOffset = 0;
     for (let i = 0; i < pageCount; i++) {
       const pageAst = pages_info.page(i);
       pageInfos.push({
-        pageOffset: pageAst.page_off,
+        pageOffset: cumulativeOffset,
         width: pageAst.width_pt,
         height: pageAst.height_pt,
       });
+      cumulativeOffset += pageAst.height_pt;
     }
 
     return pageInfos;
@@ -161,6 +163,15 @@ export class RenderSession {
 
   getSourceLoc(path: Uint32Array): string | undefined {
     return (this[kObject] as typst.RenderSession).source_span(path);
+  }
+
+  getSourceLocFromSpan(spanHex: string): string | undefined {
+    return (this[kObject] as typst.RenderSession).source_loc_from_span(spanHex);
+  }
+
+  getSourceLocsFromSpans(spanHexes: string[]): Record<string, any> | undefined {
+    const arr = new (globalThis.Array)(...spanHexes);
+    return (this[kObject] as typst.RenderSession).source_locs_from_spans(arr) as any;
   }
 
   /**
@@ -336,13 +347,15 @@ export class TypstWorker {
     console.log(pages_info);
     const pageInfos: PageInfo[] = [];
     const pageCount = pages_info.page_count;
+    let cumulativeOffset = 0;
     for (let i = 0; i < pageCount; i++) {
       const pageAst = pages_info.page(i);
       pageInfos.push({
-        pageOffset: pageAst.page_off,
+        pageOffset: cumulativeOffset,
         width: pageAst.width_pt,
         height: pageAst.height_pt,
       });
+      cumulativeOffset += pageAst.height_pt;
     }
 
     return pageInfos;
@@ -900,6 +913,9 @@ export class TypstRendererDriver {
         }
         if (options.data_selection.js) {
           parts |= 1 << 3;
+        }
+        if (options.data_selection.source_map) {
+          parts |= 1 << 4;
         }
       }
 

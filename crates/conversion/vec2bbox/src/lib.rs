@@ -35,7 +35,7 @@ impl Vec2BBoxPass {
             VecItem::Labelled(item) => self.bbox_of(module, item.1, ts),
             VecItem::Group(g) => {
                 let mut r = Rect::default();
-                for (p, f) in g.0.iter() {
+                for (p, f) in g.items.iter() {
                     let sub_bbox = self.bbox_of(module, *f, ts);
                     if let Some(sub_bbox) = sub_bbox {
                         union(&mut r, *p, sub_bbox);

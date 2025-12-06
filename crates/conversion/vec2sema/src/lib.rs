@@ -61,7 +61,7 @@ impl SemaTask {
         use VecItem::*;
         match item {
             Group(t) => {
-                for (pos, child) in t.0.iter() {
+                for (pos, child) in t.items.iter() {
                     let ts = ts.pre_translate(pos.x.0, pos.y.0);
                     self.prepare_text_rects(ctx, ts, *child);
                 }
@@ -312,7 +312,7 @@ impl SemaTask {
         match item {
             Group(t) => {
                 output.push(Cow::Borrowed(r#"<span class="typst-content-group">"#));
-                for (pos, child) in t.0.iter() {
+                for (pos, child) in t.items.iter() {
                     let ts = ts.pre_translate(pos.x.0, pos.y.0);
                     self.render_semantics_walk(ctx, ts, *child, fallbacks, output);
                 }

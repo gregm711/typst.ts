@@ -1,7 +1,9 @@
 use js_sys::Uint8Array;
 use reflexo_typst::error::prelude::*;
 use reflexo_typst::svg::{DefaultExportFeature, SvgDataSelection, SvgExporter};
+use reflexo_typst::vector::ir::PageMetadata;
 use reflexo_typst2vec::geom::{Axes, Scalar};
+use serde_json;
 use wasm_bindgen::prelude::*;
 
 use crate::{RenderSession, TypstRenderer};
@@ -52,12 +54,14 @@ impl TypstRenderer {
         };
 
         let view = layout.pages(client.module()).unwrap();
+        session.update_metadata(&client);
 
         let parts = parts.map(|parts| SvgDataSelection {
             body: 0 != (parts & (1 << 0)),
             defs: 0 != (parts & (1 << 1)),
             css: 0 != (parts & (1 << 2)),
             js: 0 != (parts & (1 << 3)),
+            source_map: 0 != (parts & (1 << 4)),
         });
 
         let svg = UsingExporter::render_flat_svg(view.module(), view.pages(), parts);
@@ -120,6 +124,7 @@ impl TypstRenderer {
         }
 
         let view = layout.1.pages(client.module()).unwrap();
+        session.update_metadata(&client);
         let svg = UsingExporter::render_flat_svg(view.module(), view.pages(), None);
         drop(client);
 

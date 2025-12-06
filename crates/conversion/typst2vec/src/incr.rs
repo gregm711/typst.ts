@@ -3,11 +3,19 @@ use reflexo::typst::TypstDocument;
 use reflexo::vector::ir::{ModuleMetadata, Page};
 
 use super::ir::FlatModule;
+use super::layout::{PageGlyphPositions, PageLayout};
 use super::pass::IncrTypst2VecPass;
 use crate::debug_loc::{ElementPoint, SourceSpanOffset};
 
 /// Client side implementation is free from typst details.
 pub use reflexo::vector::incr::{IncrDocClient, IncrDocClientKern};
+
+/// Binary delta plus accompanying per-span layout map.
+pub struct PackedDelta {
+    pub bytes: Vec<u8>,
+    pub layout_map: Vec<PageLayout>,
+    pub glyph_map: Vec<PageGlyphPositions>,
+}
 
 /// maintains the data of the incremental rendering at server side
 #[derive(Default)]
@@ -16,8 +24,34 @@ pub struct IncrDocServer {
     /// Initially it is None meaning no completed compilation.
     pages: Option<Vec<Page>>,
 
+    /// GC policy to avoid full scans on every incremental compile.
+    gc_policy: GcPolicy,
+    /// Number of incremental compiles since last GC.
+    gc_counter: u32,
+
     /// Maintaining typst -> vector status
     typst2vec: IncrTypst2VecPass,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct GcPolicy {
+    /// Trigger GC when item count exceeds this threshold.
+    min_items: usize,
+    /// Trigger GC every `interval` compiles regardless of size.
+    interval: u32,
+    /// Lifetime threshold passed to typst2vec.gc (kept consistent with existing behavior).
+    lifetime_threshold: u64,
+}
+
+impl Default for GcPolicy {
+    fn default() -> Self {
+        // Conservative defaults: scan every 100 compiles or after 10k items.
+        Self {
+            min_items: 10_000,
+            interval: 100,
+            lifetime_threshold: 5 * 2,
+        }
+    }
 }
 
 impl IncrDocServer {
@@ -29,17 +63,27 @@ impl IncrDocServer {
     }
 
     /// Pack the delta into a binary blob.
-    pub fn pack_delta(&mut self, output: &TypstDocument) -> Vec<u8> {
+    pub fn pack_delta(&mut self, output: &TypstDocument) -> PackedDelta {
         self.typst2vec.spans.reset();
 
         // Increment the lifetime of all items to touch.
         self.typst2vec.increment_lifetime();
 
-        // it is important to call gc before building pages
-        let gc_items = self.typst2vec.gc(5 * 2);
+        // Decide whether to GC this cycle.
+        self.gc_counter = self.gc_counter.wrapping_add(1);
+        let items_len = self.typst2vec.items_len();
+        let should_gc = self.gc_counter % self.gc_policy.interval == 0
+            || items_len > self.gc_policy.min_items;
+
+        let gc_items = if should_gc {
+            self.gc_counter = 0; // reset counter on GC
+            self.typst2vec.gc(self.gc_policy.lifetime_threshold)
+        } else {
+            Vec::new()
+        };
 
         // run typst2vec pass
-        let pages = self.typst2vec.doc(output);
+        let (pages, layout_map, glyph_map) = self.typst2vec.doc(output);
         self.pages = Some(pages.clone());
 
         // let new_items = builder.new_items.get_mut().len();
@@ -86,7 +130,11 @@ impl IncrDocServer {
         let delta = m.to_bytes();
 
         // log::info!("svg render time (incremental bin): {:?}", instant.elapsed());
-        [b"diff-v1,", delta.as_slice()].concat()
+        PackedDelta {
+            bytes: [b"diff-v1,", delta.as_slice()].concat(),
+            layout_map,
+            glyph_map,
+        }
     }
 
     /// Pack the current entirely into a binary blob.

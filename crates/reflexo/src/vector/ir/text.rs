@@ -186,4 +186,6 @@ pub struct TextItemContent {
     /// The glyphs in the text.
     /// (offset, advance, glyph): ([`Abs`], [`Abs`], [`FlatGlyphItem`])
     pub glyphs: Arc<[GlyphData]>,
+    /// The span id of the text item.
+    pub span_id: Option<u64>,
 }

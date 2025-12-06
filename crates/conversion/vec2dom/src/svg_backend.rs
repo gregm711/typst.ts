@@ -16,8 +16,8 @@ pub struct IncrementalSvgExportFeature;
 impl reflexo_vec2svg::ExportFeature for IncrementalSvgExportFeature {
     const ENABLE_INLINED_SVG: bool = false;
     const ENABLE_TRACING: bool = false;
-    const SHOULD_ATTACH_DEBUG_INFO: bool = false;
-    const SHOULD_RENDER_TEXT_ELEMENT: bool = false;
+    const SHOULD_ATTACH_DEBUG_INFO: bool = true;
+    const SHOULD_RENDER_TEXT_ELEMENT: bool = true;
     const USE_STABLE_GLYPH_ID: bool = true;
     const SHOULD_RASTERIZE_TEXT: bool = false;
     const WITH_BUILTIN_CSS: bool = false;
@@ -132,7 +132,7 @@ impl TypstPageElem {
                 let mut ch = g.first_element_child();
 
                 let mut children = vec![];
-                for (p, fg) in gr.0.iter() {
+                for (p, fg) in gr.items.iter() {
                     #[cfg(feature = "debug_attach")]
                     web_sys::console::log_3(
                         &format!(

@@ -19,6 +19,7 @@ ansi-to-html.workspace = true
 comemo.workspace = true
 base64.workspace = true
 
+serde.workspace = true
 serde-wasm-bindgen.workspace = true
 serde_json.workspace = true
 
@@ -48,6 +49,7 @@ typst-ts-test-common.workspace = true
 hex.workspace = true
 sha2.workspace = true
 web-sys = { workspace = true, features = ["console"] }
+tiny-skia-path.workspace = true
 
 [features]
 full = ["web", "web_test", "fonts", "misc"]

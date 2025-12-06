@@ -34,6 +34,7 @@ pub struct SvgDataSelection {
     pub defs: bool,
     pub css: bool,
     pub js: bool,
+    pub source_map: bool,
 }
 
 /// All the features that can be enabled or disabled.
@@ -79,7 +80,7 @@ pub type DefaultSvgTask = SvgTask<'static, DefaultExportFeature>;
 impl ExportFeature for DefaultExportFeature {
     const ENABLE_INLINED_SVG: bool = false;
     const ENABLE_TRACING: bool = false;
-    const SHOULD_ATTACH_DEBUG_INFO: bool = false;
+    const SHOULD_ATTACH_DEBUG_INFO: bool = true;
     const SHOULD_RENDER_TEXT_ELEMENT: bool = true;
     const USE_STABLE_GLYPH_ID: bool = true;
     const SHOULD_RASTERIZE_TEXT: bool = false;
@@ -95,7 +96,7 @@ pub type PlainSvgTask = SvgTask<'static, SvgExportFeature>;
 impl ExportFeature for SvgExportFeature {
     const ENABLE_INLINED_SVG: bool = false;
     const ENABLE_TRACING: bool = false;
-    const SHOULD_ATTACH_DEBUG_INFO: bool = false;
+    const SHOULD_ATTACH_DEBUG_INFO: bool = true;
     const SHOULD_RENDER_TEXT_ELEMENT: bool = true;
     const USE_STABLE_GLYPH_ID: bool = true;
     const SHOULD_RASTERIZE_TEXT: bool = false;

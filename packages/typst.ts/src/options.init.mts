@@ -155,7 +155,7 @@ export function preloadFontAssets(options?: LoadRemoteAssetsOptions): BeforeBuil
 }
 
 export function _resolveAssets(options?: LoadRemoteFontsOptions) {
-  const fonts = [];
+  const fonts: string[] = [];
   if (
     options &&
     options?.assets !== false &&
