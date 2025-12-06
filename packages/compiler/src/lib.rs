@@ -129,6 +129,33 @@ struct SyntaxNodeInfo {
     depth: Option<usize>,
 }
 
+/// Tooltip payload for LSP-lite responses.
+#[cfg(feature = "incr")]
+#[derive(serde::Serialize)]
+struct TooltipPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    range: Option<(u32, u32)>,
+}
+
+/// Definition payload for LSP-lite responses.
+#[cfg(feature = "incr")]
+#[derive(serde::Serialize)]
+struct DefinitionPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "byteRange")]
+    byte_range: Option<(u32, u32)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
 /// Result of marker boundary detection (internal helper)
 #[cfg(feature = "incr")]
 struct MarkerBoundaries {
@@ -589,6 +616,24 @@ impl TypstCompiler {
         let mut w = self.snapshot(None, Some(main_file_path), inputs)?;
         w.incr_compile(state, diagnostics_format)
     }
+
+    #[cfg(feature = "incr")]
+    pub fn get_tooltip(&mut self, main_file_path: String, byte_offset: u32) -> Result<JsValue, JsValue> {
+        let w = self.snapshot(None, Some(main_file_path), None)?;
+        w.get_tooltip(byte_offset)
+    }
+
+    #[cfg(feature = "incr")]
+    pub fn get_definition(&mut self, main_file_path: String, byte_offset: u32) -> Result<JsValue, JsValue> {
+        let w = self.snapshot(None, Some(main_file_path), None)?;
+        w.get_definition(byte_offset)
+    }
+
+    #[cfg(feature = "incr")]
+    pub fn get_autocomplete(&mut self, main_file_path: String, byte_offset: u32) -> Result<JsValue, JsValue> {
+        let w = self.snapshot(None, Some(main_file_path), None)?;
+        w.get_autocomplete(byte_offset)
+    }
 }
 
 type CFlag<D> = FlagTask<CompilationTask<D>>;
@@ -602,6 +647,196 @@ pub struct TypstCompileWorld {
 
 #[wasm_bindgen]
 impl TypstCompileWorld {
+    #[cfg(feature = "incr")]
+    pub fn get_autocomplete(&self, byte_offset: u32) -> Result<JsValue, JsValue> {
+        use ::typst::syntax::Source;
+        use typst_ide::autocomplete;
+
+        let world = &self.graph.snap.world;
+        let main_id = world.main();
+        let source: Source = world
+            .source(main_id)
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+
+        let doc = match self.graph.snap.compiled::<TypstPagedDocument>() {
+            Ok(Some(doc)) => doc,
+            _ => return Ok(JsValue::NULL),
+        };
+
+        let cursor = byte_offset as usize;
+        let result = autocomplete(
+            &typst_ide::IdeWorld::new(world),
+            doc.as_deref(),
+            &source,
+            cursor,
+            true,
+        );
+
+        if let Some((_, items)) = result {
+          #[derive(serde::Serialize)]
+          struct CompletionPayload {
+              label: String,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              apply: Option<String>,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              detail: Option<String>,
+              #[serde(skip_serializing_if = "Option::is_none")]
+              kind: Option<String>,
+              range: (u32, u32),
+          }
+
+          let mapped: Vec<CompletionPayload> = items
+              .into_iter()
+              .map(|item| CompletionPayload {
+                  label: item.label,
+                  apply: item.apply,
+                  detail: item.detail,
+                  kind: item.kind.map(|k| format!("{:?}", k)),
+                  range: (item.range.start as u32, item.range.end as u32),
+              })
+              .collect();
+
+          return Ok(serde_wasm_bindgen::to_value(&mapped)?);
+        }
+
+        Ok(JsValue::NULL)
+    }
+
+    #[cfg(feature = "incr")]
+    pub fn get_tooltip(&self, byte_offset: u32) -> Result<JsValue, JsValue> {
+        use ::typst::syntax::{Source, SyntaxKind, SyntaxNode};
+
+        let world = &self.graph.snap.world;
+        let main_id = world.main();
+        let source: Source = world
+            .source(main_id)
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        let text = source.text();
+        if (byte_offset as usize) > text.len() {
+            return Ok(JsValue::NULL);
+        }
+
+        let mut best: Option<(usize, usize, SyntaxKind)> = None;
+
+        fn visit(
+            node: SyntaxNode,
+            source: &Source,
+            offset: usize,
+            best: &mut Option<(usize, usize, SyntaxKind)>,
+        ) {
+            if let Some(range) = source.range(node.span()) {
+                if offset >= range.start && offset < range.end {
+                    let len = range.end - range.start;
+                    match best {
+                        Some((_, best_len, _)) if len >= *best_len => {}
+                        _ => {
+                            *best = Some((range.start, len, node.kind()));
+                        }
+                    }
+                    for child in node.children() {
+                        visit(child, source, offset, best);
+                    }
+                }
+            }
+        }
+
+        visit(source.root(), &source, byte_offset as usize, &mut best);
+
+        if let Some((start, len, kind)) = best {
+            let end = start + len;
+            let snippet = text
+                .get(start..end)
+                .map(|s| {
+                    let trimmed = s.trim();
+                    let mut owned = trimmed.to_string();
+                    if owned.len() > 200 {
+                        owned.truncate(200);
+                    }
+                    owned
+                })
+                .unwrap_or_default();
+            let payload = crate::TooltipPayload {
+                kind: Some(format!("{:?}", kind)),
+                title: format!("{:?}", kind),
+                detail: if snippet.is_empty() { None } else { Some(snippet) },
+                range: Some((start as u32, end as u32)),
+            };
+            return Ok(serde_wasm_bindgen::to_value(&payload)?);
+        }
+
+        Ok(JsValue::NULL)
+    }
+
+    #[cfg(feature = "incr")]
+    pub fn get_definition(&self, byte_offset: u32) -> Result<JsValue, JsValue> {
+        use ::typst::syntax::Source;
+
+        let world = &self.graph.snap.world;
+        let main_id = world.main();
+        let source: Source = world
+            .source(main_id)
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        let text = source.text();
+        if (byte_offset as usize) > text.len() {
+            return Ok(JsValue::NULL);
+        }
+
+        let mut best: Option<(usize, usize)> = None;
+
+        fn visit(
+            node: ::typst::syntax::SyntaxNode,
+            source: &Source,
+            offset: usize,
+            best: &mut Option<(usize, usize)>,
+        ) {
+            if let Some(range) = source.range(node.span()) {
+                if offset >= range.start && offset < range.end {
+                    let len = range.end - range.start;
+                    match best {
+                        Some((_, best_len)) if len >= *best_len => {}
+                        _ => {
+                            *best = Some((range.start, len));
+                        }
+                    }
+                    for child in node.children() {
+                        visit(child, source, offset, best);
+                    }
+                }
+            }
+        }
+
+        visit(
+            source.root(),
+            &source,
+            byte_offset as usize,
+            &mut best,
+        );
+
+        if let Some((start, len)) = best {
+            let end = start + len;
+            let snippet = text
+                .get(start..end)
+                .map(|s| {
+                    let trimmed = s.trim();
+                    let mut owned = trimmed.to_string();
+                    if owned.len() > 200 {
+                        owned.truncate(200);
+                    }
+                    owned
+                })
+                .unwrap_or_default();
+            let payload = crate::DefinitionPayload {
+                path: None,
+                byte_range: Some((start as u32, end as u32)),
+                snippet: if snippet.is_empty() { None } else { Some(snippet) },
+                message: None,
+            };
+            return Ok(serde_wasm_bindgen::to_value(&payload)?);
+        }
+
+        Ok(JsValue::NULL)
+    }
+
     pub fn compile(&mut self, kind: u8, diagnostics_format: u8) -> Result<JsValue, JsValue> {
         match kind {
             0 => {
