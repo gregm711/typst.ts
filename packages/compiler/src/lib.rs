@@ -34,6 +34,77 @@ use crate::font::FontResolverImpl;
 use crate::utils::console_log;
 #[cfg(feature = "incr")]
 use incr::IncrServer;
+#[cfg(feature = "incr")]
+use tinymist_world::OptionDocumentTask;
+#[cfg(feature = "incr")]
+use tinymist_world::CompilerFeat;
+#[cfg(feature = "incr")]
+use ::typst::ecow::EcoString;
+#[cfg(feature = "incr")]
+use ::typst::text::{Font, FontBook};
+#[cfg(feature = "incr")]
+use ::typst::foundations::{Bytes, Datetime};
+#[cfg(feature = "incr")]
+use ::typst::diag::FileResult;
+#[cfg(feature = "incr")]
+use ::typst::syntax::{FileId, Source};
+#[cfg(feature = "incr")]
+use ::typst::syntax::package::PackageSpec;
+#[cfg(feature = "incr")]
+use ::typst::utils::LazyHash;
+#[cfg(feature = "incr")]
+use ::typst::{Library, World as TypstWorld};
+
+#[cfg(feature = "incr")]
+struct IdeWorldWrapper<'a, F: CompilerFeat> {
+    world: &'a reflexo_typst::world::CompilerWorld<F>,
+}
+
+#[cfg(feature = "incr")]
+impl<'a, F: CompilerFeat> TypstWorld for IdeWorldWrapper<'a, F> {
+    fn library(&self) -> &LazyHash<Library> {
+        self.world.library()
+    }
+
+    fn book(&self) -> &LazyHash<FontBook> {
+        self.world.book()
+    }
+
+    fn main(&self) -> FileId {
+        self.world.main()
+    }
+
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        self.world.source(id)
+    }
+
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        self.world.file(id)
+    }
+
+    fn font(&self, index: usize) -> Option<Font> {
+        self.world.font(index)
+    }
+
+    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+        self.world.today(offset)
+    }
+}
+
+#[cfg(feature = "incr")]
+impl<'a, F: CompilerFeat> typst_ide::IdeWorld for IdeWorldWrapper<'a, F> {
+    fn upcast(&self) -> &dyn TypstWorld {
+        self
+    }
+
+    fn packages(&self) -> &[(PackageSpec, Option<EcoString>)] {
+        &[]
+    }
+
+    fn files(&self) -> Vec<FileId> {
+        Vec::new()
+    }
+}
 
 /// Line box for consistent cursor height.
 /// Represents a visual line inferred from text item Y positions.
@@ -649,7 +720,7 @@ pub struct TypstCompileWorld {
 impl TypstCompileWorld {
     #[cfg(feature = "incr")]
     pub fn get_autocomplete(&self, byte_offset: u32) -> Result<JsValue, JsValue> {
-        use ::typst::syntax::Source;
+        use reflexo_typst::typst::syntax::Source;
         use typst_ide::autocomplete;
 
         let world = &self.graph.snap.world;
@@ -658,45 +729,46 @@ impl TypstCompileWorld {
             .source(main_id)
             .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
 
-        let doc = match self.graph.snap.compiled::<TypstPagedDocument>() {
-            Ok(Some(doc)) => doc,
-            _ => return Ok(JsValue::NULL),
+        let doc = self
+            .graph
+            .compute::<OptionDocumentTask<TypstPagedDocument>>()
+            .map_err(|e| JsValue::from_str(&format!("{e:?}")))?;
+        let doc = match doc.as_ref() {
+            Some(doc) => doc.clone(),
+            None => return Ok(JsValue::NULL),
         };
 
         let cursor = byte_offset as usize;
-        let result = autocomplete(
-            &typst_ide::IdeWorld::new(world),
-            doc.as_deref(),
-            &source,
-            cursor,
-            true,
-        );
 
-        if let Some((_, items)) = result {
-          #[derive(serde::Serialize)]
-          struct CompletionPayload {
-              label: String,
-              #[serde(skip_serializing_if = "Option::is_none")]
-              apply: Option<String>,
-              #[serde(skip_serializing_if = "Option::is_none")]
-              detail: Option<String>,
-              #[serde(skip_serializing_if = "Option::is_none")]
-              kind: Option<String>,
-              range: (u32, u32),
-          }
+        let world_adapter = IdeWorldWrapper { world };
 
-          let mapped: Vec<CompletionPayload> = items
-              .into_iter()
-              .map(|item| CompletionPayload {
-                  label: item.label,
-                  apply: item.apply,
-                  detail: item.detail,
-                  kind: item.kind.map(|k| format!("{:?}", k)),
-                  range: (item.range.start as u32, item.range.end as u32),
-              })
-              .collect();
+        let result = autocomplete(&world_adapter, Some(doc.as_ref()), &source, cursor, true);
 
-          return Ok(serde_wasm_bindgen::to_value(&mapped)?);
+        if let Some((from, items)) = result {
+            #[derive(serde::Serialize)]
+            struct CompletionPayload {
+                label: String,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                apply: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                detail: Option<String>,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                kind: Option<String>,
+                range: (u32, u32),
+            }
+
+            let mapped: Vec<CompletionPayload> = items
+                .into_iter()
+                .map(|item| CompletionPayload {
+                    label: item.label.to_string(),
+                    apply: item.apply.map(|a| a.to_string()),
+                    detail: item.detail.map(|d| d.to_string()),
+                    kind: Some(format!("{:?}", item.kind)),
+                    range: (from as u32, cursor as u32),
+                })
+                .collect();
+
+            return Ok(serde_wasm_bindgen::to_value(&mapped)?);
         }
 
         Ok(JsValue::NULL)
@@ -734,13 +806,13 @@ impl TypstCompileWorld {
                         }
                     }
                     for child in node.children() {
-                        visit(child, source, offset, best);
+                        visit(child.clone(), source, offset, best);
                     }
                 }
             }
         }
 
-        visit(source.root(), &source, byte_offset as usize, &mut best);
+        visit(source.root().clone(), &source, byte_offset as usize, &mut best);
 
         if let Some((start, len, kind)) = best {
             let end = start + len;
@@ -799,18 +871,13 @@ impl TypstCompileWorld {
                         }
                     }
                     for child in node.children() {
-                        visit(child, source, offset, best);
+                        visit(child.clone(), source, offset, best);
                     }
                 }
             }
         }
 
-        visit(
-            source.root(),
-            &source,
-            byte_offset as usize,
-            &mut best,
-        );
+        visit(source.root().clone(), &source, byte_offset as usize, &mut best);
 
         if let Some((start, len)) = best {
             let end = start + len;

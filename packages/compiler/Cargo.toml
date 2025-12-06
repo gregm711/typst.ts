@@ -42,6 +42,8 @@ reflexo-typst = { workspace = true, features = ["web"] }
 reflexo-vec2svg.workspace = true
 typst.workspace = true
 typst-assets = { workspace = true, optional = true }
+typst-ide.workspace = true
+tinymist-world.workspace = true
 
 [dev-dependencies]
 wasm-bindgen-test.workspace = true
