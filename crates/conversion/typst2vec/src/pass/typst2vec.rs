@@ -57,9 +57,12 @@ thread_local! {
     static PATH_STYLE_BUF: RefCell<Vec<PathStyle>> = RefCell::new(Vec::new());
 }
 
-struct LayoutCollector {
+/// Collects span bounding boxes and glyph positions during frame traversal.
+/// Used to build layoutMap and glyphPositions for cursor/selection positioning.
+pub(crate) struct LayoutCollector {
     spans: Mutex<HashMap<u64, Rect>>,
-    glyphs: Mutex<HashMap<u64, GlyphRun>>,
+    /// Stores glyph runs per span. A span may have multiple runs when text wraps across lines.
+    glyphs: Mutex<HashMap<u64, Vec<GlyphRun>>>,
 }
 
 impl Default for LayoutCollector {
@@ -79,7 +82,7 @@ struct GlyphRun {
 }
 
 impl LayoutCollector {
-    fn record_span(&self, span: u64, rect: Rect, transform: Transform) {
+    pub(crate) fn record_span(&self, span: u64, rect: Rect, transform: Transform) {
         if span == 0 || rect.is_empty() {
             return;
         }
@@ -96,7 +99,7 @@ impl LayoutCollector {
             .or_insert(world);
     }
 
-    fn record_glyph_positions(
+    pub(crate) fn record_glyph_positions(
         &self,
         span: u64,
         positions: Vec<f32>,
@@ -107,17 +110,17 @@ impl LayoutCollector {
             return;
         }
         let mut glyphs = self.glyphs.lock();
-        glyphs.insert(
-            span,
-            GlyphRun {
+        glyphs
+            .entry(span)
+            .or_insert_with(Vec::new)
+            .push(GlyphRun {
                 positions,
                 glyph_spans,
                 dir_rtl,
-            },
-        );
+            });
     }
 
-    fn to_page_layout(&self, page: u32) -> PageLayout {
+    pub(crate) fn to_page_layout(&self, page: u32) -> PageLayout {
         let spans = self
             .spans
             .lock()
@@ -134,16 +137,18 @@ impl LayoutCollector {
         PageLayout { page, spans }
     }
 
-    fn to_page_glyph_map(&self, page: u32) -> PageGlyphPositions {
+    pub(crate) fn to_page_glyph_map(&self, page: u32) -> PageGlyphPositions {
         let spans = self
             .glyphs
             .lock()
             .iter()
-            .map(|(span, run)| SpanGlyphPositions {
-                span: *span,
-                positions: run.positions.clone(),
-                glyph_spans: run.glyph_spans.clone(),
-                dir_rtl: run.dir_rtl,
+            .flat_map(|(span, runs)| {
+                runs.iter().map(move |run| SpanGlyphPositions {
+                    span: *span,
+                    positions: run.positions.clone(),
+                    glyph_spans: run.glyph_spans.clone(),
+                    dir_rtl: run.dir_rtl,
+                })
             })
             .collect();
 
@@ -184,8 +189,11 @@ fn transform_point(point: Point, transform: Transform) -> Point {
 #[derive(Clone, Copy)]
 struct State<'a> {
     introspector: &'a Introspector,
-    /// The transform of the current item.
+    /// The transform of the current item (used for rendering, may be reset for hard frames).
     pub transform: Transform,
+    /// The transform for layout recording - always page-absolute, never reset.
+    /// This accumulates all parent translations and is used for glyph/span positioning.
+    pub page_transform: Transform,
     /// The size of the first hard frame in the hierarchy.
     pub size: ir::Size,
 }
@@ -195,6 +203,7 @@ impl State<'_> {
         State {
             introspector,
             transform: Transform::identity(),
+            page_transform: Transform::identity(),
             size,
         }
     }
@@ -205,9 +214,11 @@ impl State<'_> {
     }
 
     /// Pre concat the current item's transform.
+    /// This updates BOTH transform (for rendering) and page_transform (for layout recording).
     pub fn pre_concat(self, transform: ir::Transform) -> Self {
         Self {
             transform: self.transform.pre_concat(transform),
+            page_transform: self.page_transform.pre_concat(transform),
             ..self
         }
     }
@@ -217,7 +228,9 @@ impl State<'_> {
         Self { size, ..self }
     }
 
-    /// Sets the current item's transform.
+    /// Sets the current item's render transform.
+    /// NOTE: This only resets the render transform, NOT page_transform.
+    /// page_transform is preserved to maintain page-absolute coordinates for layout recording.
     pub fn with_transform(self, transform: ir::Transform) -> Self {
         Self { transform, ..self }
     }
@@ -621,7 +634,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
 
                     if let Some(layout) = &layout {
                         // Compute per-span bounds and glyph x positions (page space).
-                        let dir_rtl = false;
+                        let dir_rtl = matches!(text.lang.dir(), Dir::RTL);
                         let mut cursor = TypstPoint::zero();
                         let mut per_span_bounds: HashMap<u64, Rect> = HashMap::new();
                         let mut per_span_glyphs: HashMap<u64, (Vec<f32>, Vec<u64>, Option<f32>)> =
@@ -683,19 +696,22 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                             if id != 0 {
                                 let start = cursor + offset;
                                 let end = start + advance;
+                                // Use page_transform (not transform) to get page-absolute coordinates
+                                // for glyph positions. transform may be reset for hard frames,
+                                // but page_transform always accumulates parent translations.
                                 let start_point = transform_point(
                                     Point::new(
                                         Scalar(start.x.to_pt() as f32),
                                         Scalar(-(start.y.to_pt() as f32)),
                                     ),
-                                    state.transform,
+                                    state.page_transform,
                                 );
                                 let end_point = transform_point(
                                     Point::new(
                                         Scalar(end.x.to_pt() as f32),
                                         Scalar(-(end.y.to_pt() as f32)),
                                     ),
-                                    state.transform,
+                                    state.page_transform,
                                 );
 
                                 let entry = per_span_glyphs
@@ -710,7 +726,8 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         }
 
                         for (id, rect) in per_span_bounds {
-                            layout.record_span(id, rect, state.transform);
+                            // Use page_transform for page-absolute span bounding boxes
+                            layout.record_span(id, rect, state.page_transform);
                         }
 
                         for (id, (mut positions, glyph_spans, last_end)) in per_span_glyphs {
@@ -749,7 +766,8 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
 
                         let id = s.into_raw().get();
                         if id != 0 {
-                            layout.record_span(id, rect, state.transform);
+                            // Use page_transform for page-absolute span bounding boxes
+                            layout.record_span(id, rect, state.page_transform);
                         }
                     }
 
@@ -769,7 +787,8 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         let rect = rect_from_size(*size);
                         let id = s.into_raw().get();
                         if id != 0 {
-                            layout.record_span(id, rect, state.transform);
+                            // Use page_transform for page-absolute span bounding boxes
+                            layout.record_span(id, rect, state.page_transform);
                         }
                     }
 
