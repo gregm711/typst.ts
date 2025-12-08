@@ -17,6 +17,7 @@ pub use crate::builder::TypstFontResolver;
 pub use reflexo_typst::*;
 
 use core::fmt;
+use std::collections::HashSet;
 use std::{fmt::Write, path::Path, sync::Arc};
 
 use error::TypstSourceDiagnostic;
@@ -991,15 +992,23 @@ impl TypstCompileWorld {
         state: &mut IncrServer,
         diagnostics_format: u8,
     ) -> Result<JsValue, JsValue> {
+        // Take the page filter for this compile (resets to None for next compile)
+        let page_filter = state.take_glyph_map_pages();
+
         let Some(doc) = self.do_compile_paged()? else {
             return self.get_diag::<TypstPagedDocument>(diagnostics_format);
         };
 
         // Collect line boxes before updating state (we need the doc reference)
+        // Line boxes are always collected for all pages (needed for cursor height)
         let line_boxes = self.collect_line_boxes(&doc);
 
         // Collect glyph maps for accurate click-to-cursor positioning
-        let glyph_maps = self.collect_glyph_maps(&doc);
+        // Filter to only requested pages if page_filter is set
+        let glyph_maps = self.collect_glyph_maps(&doc, page_filter.as_ref());
+
+        // Get total page count BEFORE moving doc into state.update()
+        let total_page_count = doc.pages.len() as u32;
 
         let delta = state.update(doc);
         let v = Uint8Array::from(delta.bytes.as_slice()).into();
@@ -1027,16 +1036,47 @@ impl TypstCompileWorld {
             }
         };
 
+        // Filter glyph positions by page if filter is active
+        let glyph_positions = if let Some(filter) = &page_filter {
+            delta.glyph_map.iter()
+                .filter(|gp| filter.contains(&gp.page))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            delta.glyph_map.clone()
+        };
+
         // Serialize glyph positions from typst2vec lowering (page-space x positions).
         let glyph_positions_js =
-            serde_wasm_bindgen::to_value(&delta.glyph_map).unwrap_or(JsValue::NULL);
+            serde_wasm_bindgen::to_value(&glyph_positions).unwrap_or(JsValue::NULL);
 
         // Collect syntax nodes for editor protection (headings, lists, math, etc.)
         let syntax_nodes = self.collect_syntax_nodes();
         let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
 
+        // Filter layout map by page if filter is active
+        let layout_map = if let Some(filter) = &page_filter {
+            delta.layout_map.iter()
+                .filter(|lp| filter.contains(&lp.page))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            delta.layout_map.clone()
+        };
+
         let layout_map_js =
-            serde_wasm_bindgen::to_value(&delta.layout_map).unwrap_or(JsValue::NULL);
+            serde_wasm_bindgen::to_value(&layout_map).unwrap_or(JsValue::NULL);
+
+        // Log filtering info
+        if let Some(filter) = &page_filter {
+            console_log(format!(
+                "[incr_compile] Page filter active: {} pages requested, {} total pages. Returning {} glyph_positions, {} layout_map entries",
+                filter.len(),
+                total_page_count,
+                glyph_positions.len(),
+                layout_map.len()
+            ));
+        }
 
         Ok(if diagnostics_format != 0 {
             console_log(format!("[incr_compile] Building result object with diagnostics_format={}", diagnostics_format));
@@ -1048,6 +1088,14 @@ impl TypstCompileWorld {
             js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
             js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
             js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
+            // Always include total page count so main thread knows document size
+            js_sys::Reflect::set(&result, &"totalPageCount".into(), &JsValue::from(total_page_count))?;
+            // Include filtered pages array if filter was active
+            if let Some(filter) = &page_filter {
+                let filtered_pages: Vec<u32> = filter.iter().copied().collect();
+                let filtered_pages_js = serde_wasm_bindgen::to_value(&filtered_pages).unwrap_or(JsValue::NULL);
+                js_sys::Reflect::set(&result, &"filteredPages".into(), &filtered_pages_js)?;
+            }
             console_log(format!("[incr_compile] Result object created, glyphMaps set (value is_null={})", glyph_maps_js.is_null()));
             result.into()
         } else {
@@ -1388,8 +1436,11 @@ impl TypstCompileWorld {
     /// Collect glyph maps from the laid-out document.
     /// For each text item, extract the per-glyph byte offsets from the span data.
     /// This enables accurate click-to-cursor positioning.
+    ///
+    /// If `page_filter` is Some, only collect glyph maps for pages in the filter set.
+    /// This enables viewport-aware compilation where only visible pages are processed.
     #[cfg(feature = "incr")]
-    fn collect_glyph_maps(&self, doc: &TypstPagedDocument) -> Vec<PageGlyphMap> {
+    fn collect_glyph_maps(&self, doc: &TypstPagedDocument, page_filter: Option<&HashSet<u32>>) -> Vec<PageGlyphMap> {
         use ::typst::World;
 
         let world = &self.graph.snap.world;
@@ -1402,6 +1453,13 @@ impl TypstCompileWorld {
         let mut page_maps: Vec<PageGlyphMap> = Vec::new();
 
         for (page_idx, page) in doc.pages.iter().enumerate() {
+            // Skip pages not in the filter set (if filter is active)
+            if let Some(filter) = page_filter {
+                if !filter.contains(&(page_idx as u32)) {
+                    continue;
+                }
+            }
+
             let mut spans: Vec<SpanGlyphMap> = Vec::new();
 
             Self::collect_glyphs_from_frame(&page.frame, &source, &mut spans);
@@ -1416,8 +1474,9 @@ impl TypstCompileWorld {
         }
 
         console_log(format!(
-            "[collect_glyph_maps] Collected {} pages with glyph maps",
-            page_maps.len()
+            "[collect_glyph_maps] Collected {} pages with glyph maps (filter={:?})",
+            page_maps.len(),
+            page_filter.map(|f| f.len())
         ));
 
         page_maps
