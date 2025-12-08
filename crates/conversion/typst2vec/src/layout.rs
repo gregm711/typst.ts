@@ -21,17 +21,27 @@ pub struct PageLayout {
     pub spans: Vec<SpanBBox>,
 }
 
-/// Glyph-level x positions for a span (page coordinates, points).
+/// Glyph-level x positions for a single text run (page coordinates, points).
+/// A span may have multiple runs when text wraps across lines.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpanGlyphPositions {
     #[serde(serialize_with = "crate::layout::serialize_span_hex")]
     pub span: u64,
+    /// 0-based index of this run among all runs for the same span.
+    /// Used to identify which line/chunk of a wrapped paragraph was clicked.
+    pub run_index: u32,
     /// X positions of glyph edges in page space, sorted in visual order.
     pub positions: Vec<f32>,
     /// Span ids for each glyph (mirrors Typst glyph span ids to resolve source).
     pub glyph_spans: Vec<u64>,
     /// True if the run is right-to-left.
     pub dir_rtl: bool,
+    /// Bounding box of this run in page coordinates (points).
+    /// Used for geometry-based run selection instead of index-based lookup.
+    pub x_min: f32,
+    pub x_max: f32,
+    pub y_min: f32,
+    pub y_max: f32,
 }
 
 /// A page worth of glyph positions.
@@ -488,20 +498,20 @@ mod layout_collector_tests {
         let collector = LayoutCollector::default();
         let span_id = 0x1252640b_u64; // The Introduction paragraph span from logs
 
-        // First line: 92 glyphs at x positions starting at 72
+        // First line: 92 glyphs at x positions starting at 72, y = 100
         let positions_line1: Vec<f32> = (0..93).map(|i| 72.0 + (i as f32) * 5.0).collect();
         let glyph_spans_line1: Vec<u64> = vec![span_id; 92];
-        collector.record_glyph_positions(span_id, positions_line1.clone(), glyph_spans_line1, false);
+        collector.record_glyph_positions(span_id, positions_line1.clone(), glyph_spans_line1, false, 72.0, 532.0, 100.0, 112.0);
 
-        // Second line: 90 glyphs at x positions starting at 72 (new line)
+        // Second line: 90 glyphs at x positions starting at 72 (new line), y = 115
         let positions_line2: Vec<f32> = (0..91).map(|i| 72.0 + (i as f32) * 5.0).collect();
         let glyph_spans_line2: Vec<u64> = vec![span_id; 90];
-        collector.record_glyph_positions(span_id, positions_line2.clone(), glyph_spans_line2, false);
+        collector.record_glyph_positions(span_id, positions_line2.clone(), glyph_spans_line2, false, 72.0, 522.0, 115.0, 127.0);
 
-        // Third line: 49 glyphs
+        // Third line: 49 glyphs, y = 130
         let positions_line3: Vec<f32> = (0..50).map(|i| 72.0 + (i as f32) * 5.0).collect();
         let glyph_spans_line3: Vec<u64> = vec![span_id; 49];
-        collector.record_glyph_positions(span_id, positions_line3.clone(), glyph_spans_line3, false);
+        collector.record_glyph_positions(span_id, positions_line3.clone(), glyph_spans_line3, false, 72.0, 317.0, 130.0, 142.0);
 
         let glyph_map = collector.to_page_glyph_map(0);
 
@@ -515,6 +525,16 @@ mod layout_collector_tests {
 
         // All entries should have the same span ID
         assert!(glyph_map.spans.iter().all(|s| s.span == span_id));
+
+        // Verify run_index is assigned correctly
+        assert_eq!(glyph_map.spans[0].run_index, 0);
+        assert_eq!(glyph_map.spans[1].run_index, 1);
+        assert_eq!(glyph_map.spans[2].run_index, 2);
+
+        // Verify Y bounds are different for each run (distinguishes lines)
+        assert!((glyph_map.spans[0].y_min - 100.0).abs() < 0.001);
+        assert!((glyph_map.spans[1].y_min - 115.0).abs() < 0.001);
+        assert!((glyph_map.spans[2].y_min - 130.0).abs() < 0.001);
     }
 
     /// TEST: Verify what CORRECT multi-line glyph handling would look like
@@ -528,14 +548,14 @@ mod layout_collector_tests {
         let collector = LayoutCollector::default();
         let span_id = 0x1252640b_u64;
 
-        // Three lines of text
+        // Three lines of text at different Y positions
         let positions_line1: Vec<f32> = (0..93).map(|i| 72.0 + (i as f32) * 5.0).collect();
         let positions_line2: Vec<f32> = (0..91).map(|i| 72.0 + (i as f32) * 5.0).collect();
         let positions_line3: Vec<f32> = (0..50).map(|i| 72.0 + (i as f32) * 5.0).collect();
 
-        collector.record_glyph_positions(span_id, positions_line1.clone(), vec![span_id; 92], false);
-        collector.record_glyph_positions(span_id, positions_line2.clone(), vec![span_id; 90], false);
-        collector.record_glyph_positions(span_id, positions_line3.clone(), vec![span_id; 49], false);
+        collector.record_glyph_positions(span_id, positions_line1.clone(), vec![span_id; 92], false, 72.0, 532.0, 100.0, 112.0);
+        collector.record_glyph_positions(span_id, positions_line2.clone(), vec![span_id; 90], false, 72.0, 522.0, 115.0, 127.0);
+        collector.record_glyph_positions(span_id, positions_line3.clone(), vec![span_id; 49], false, 72.0, 317.0, 130.0, 142.0);
 
         let glyph_map = collector.to_page_glyph_map(0);
 
@@ -567,7 +587,7 @@ mod layout_collector_tests {
 
         let positions: Vec<f32> = vec![72.0, 77.0, 82.0, 87.0, 92.0];
         let glyph_spans: Vec<u64> = vec![span_id; 4];
-        collector.record_glyph_positions(span_id, positions.clone(), glyph_spans, false);
+        collector.record_glyph_positions(span_id, positions.clone(), glyph_spans, false, 72.0, 92.0, 50.0, 62.0);
 
         let glyph_map = collector.to_page_glyph_map(0);
         assert_eq!(glyph_map.spans.len(), 1);
@@ -576,6 +596,13 @@ mod layout_collector_tests {
         assert_eq!(span_glyphs.positions.len(), 5);
         assert!((span_glyphs.positions[0] - 72.0).abs() < 0.001);
         assert!((span_glyphs.positions[4] - 92.0).abs() < 0.001);
+
+        // Verify bounds
+        assert_eq!(span_glyphs.run_index, 0);
+        assert!((span_glyphs.x_min - 72.0).abs() < 0.001);
+        assert!((span_glyphs.x_max - 92.0).abs() < 0.001);
+        assert!((span_glyphs.y_min - 50.0).abs() < 0.001);
+        assert!((span_glyphs.y_max - 62.0).abs() < 0.001);
     }
 
     /// TEST: Different spans don't interfere with each other
@@ -586,8 +613,8 @@ mod layout_collector_tests {
         let span1 = 0x1111_u64;
         let span2 = 0x2222_u64;
 
-        collector.record_glyph_positions(span1, vec![10.0, 20.0, 30.0], vec![span1; 2], false);
-        collector.record_glyph_positions(span2, vec![100.0, 110.0, 120.0, 130.0], vec![span2; 3], false);
+        collector.record_glyph_positions(span1, vec![10.0, 20.0, 30.0], vec![span1; 2], false, 10.0, 30.0, 50.0, 62.0);
+        collector.record_glyph_positions(span2, vec![100.0, 110.0, 120.0, 130.0], vec![span2; 3], false, 100.0, 130.0, 80.0, 92.0);
 
         let glyph_map = collector.to_page_glyph_map(0);
         assert_eq!(glyph_map.spans.len(), 2, "Should have two separate spans");
@@ -598,5 +625,38 @@ mod layout_collector_tests {
 
         assert_eq!(s1.positions.len(), 3);
         assert_eq!(s2.positions.len(), 4);
+
+        // Verify each has run_index 0 (first run for each span)
+        assert_eq!(s1.run_index, 0);
+        assert_eq!(s2.run_index, 0);
+    }
+
+    /// TEST: Run geometry allows selection by Y coordinate
+    ///
+    /// This test verifies the core feature: given a click Y coordinate,
+    /// we can find the correct run for a multi-line span.
+    #[test]
+    fn test_run_selection_by_geometry() {
+        let collector = LayoutCollector::default();
+        let span_id = 0x1234_u64;
+
+        // Three lines at Y=100-112, Y=115-127, Y=130-142
+        collector.record_glyph_positions(span_id, vec![72.0, 82.0, 92.0], vec![span_id; 2], false, 72.0, 92.0, 100.0, 112.0);
+        collector.record_glyph_positions(span_id, vec![72.0, 85.0, 98.0], vec![span_id; 2], false, 72.0, 98.0, 115.0, 127.0);
+        collector.record_glyph_positions(span_id, vec![72.0, 80.0], vec![span_id; 1], false, 72.0, 80.0, 130.0, 142.0);
+
+        let glyph_map = collector.to_page_glyph_map(0);
+
+        // Simulate frontend logic: find run whose Y range contains click Y
+        let click_y = 120.0; // Should hit the second run (Y=115-127)
+
+        let matching_run = glyph_map.spans.iter()
+            .filter(|s| s.span == span_id)
+            .find(|s| click_y >= s.y_min && click_y <= s.y_max);
+
+        assert!(matching_run.is_some(), "Should find a run for click Y=120");
+        let run = matching_run.unwrap();
+        assert_eq!(run.run_index, 1, "Click at Y=120 should match run_index=1 (second line)");
+        assert_eq!(run.positions.len(), 3, "Second line has 3 positions");
     }
 }

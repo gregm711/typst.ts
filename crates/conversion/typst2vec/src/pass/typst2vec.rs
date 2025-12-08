@@ -74,11 +74,17 @@ impl Default for LayoutCollector {
     }
 }
 
+/// A single text run for a span. A span may have multiple runs when text wraps.
 #[derive(Default)]
 struct GlyphRun {
     positions: Vec<f32>,
     glyph_spans: Vec<u64>,
     dir_rtl: bool,
+    /// Bounding box of this run in page coordinates (points).
+    x_min: f32,
+    x_max: f32,
+    y_min: f32,
+    y_max: f32,
 }
 
 impl LayoutCollector {
@@ -105,6 +111,10 @@ impl LayoutCollector {
         positions: Vec<f32>,
         glyph_spans: Vec<u64>,
         dir_rtl: bool,
+        x_min: f32,
+        x_max: f32,
+        y_min: f32,
+        y_max: f32,
     ) {
         if span == 0 || positions.is_empty() {
             return;
@@ -117,6 +127,10 @@ impl LayoutCollector {
                 positions,
                 glyph_spans,
                 dir_rtl,
+                x_min,
+                x_max,
+                y_min,
+                y_max,
             });
     }
 
@@ -143,11 +157,16 @@ impl LayoutCollector {
             .lock()
             .iter()
             .flat_map(|(span, runs)| {
-                runs.iter().map(move |run| SpanGlyphPositions {
+                runs.iter().enumerate().map(move |(run_index, run)| SpanGlyphPositions {
                     span: *span,
+                    run_index: run_index as u32,
                     positions: run.positions.clone(),
                     glyph_spans: run.glyph_spans.clone(),
                     dir_rtl: run.dir_rtl,
+                    x_min: run.x_min,
+                    x_max: run.x_max,
+                    y_min: run.y_min,
+                    y_max: run.y_max,
                 })
             })
             .collect();
@@ -637,7 +656,8 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         let dir_rtl = matches!(text.lang.dir(), Dir::RTL);
                         let mut cursor = TypstPoint::zero();
                         let mut per_span_bounds: HashMap<u64, Rect> = HashMap::new();
-                        let mut per_span_glyphs: HashMap<u64, (Vec<f32>, Vec<u64>, Option<f32>)> =
+                        // Per-span glyph data: (positions, glyph_spans, last_end_x, x_min, x_max, y_min, y_max)
+                        let mut per_span_glyphs: HashMap<u64, (Vec<f32>, Vec<u64>, Option<f32>, f32, f32, f32, f32)> =
                             HashMap::new();
 
                         for glyph in &text.glyphs {
@@ -714,12 +734,18 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                                     state.page_transform,
                                 );
 
+                                // Initialize with infinity/neg-infinity so min/max work correctly
                                 let entry = per_span_glyphs
                                     .entry(id)
-                                    .or_insert_with(|| (Vec::new(), Vec::new(), None));
+                                    .or_insert_with(|| (Vec::new(), Vec::new(), None, f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NEG_INFINITY));
                                 entry.0.push(start_point.x.0);
                                 entry.1.push(id);
                                 entry.2 = Some(end_point.x.0);
+                                // Track bounds: min/max of all glyph start/end positions
+                                entry.3 = entry.3.min(start_point.x.0).min(end_point.x.0); // x_min
+                                entry.4 = entry.4.max(start_point.x.0).max(end_point.x.0); // x_max
+                                entry.5 = entry.5.min(start_point.y.0).min(end_point.y.0); // y_min
+                                entry.6 = entry.6.max(start_point.y.0).max(end_point.y.0); // y_max
                             }
 
                             cursor += advance;
@@ -730,11 +756,11 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                             layout.record_span(id, rect, state.page_transform);
                         }
 
-                        for (id, (mut positions, glyph_spans, last_end)) in per_span_glyphs {
+                        for (id, (mut positions, glyph_spans, last_end, x_min, x_max, y_min, y_max)) in per_span_glyphs {
                             if let Some(end_x) = last_end {
                                 positions.push(end_x);
                             }
-                            layout.record_glyph_positions(id, positions, glyph_spans, dir_rtl);
+                            layout.record_glyph_positions(id, positions, glyph_spans, dir_rtl, x_min, x_max, y_min, y_max);
                         }
                     }
 
