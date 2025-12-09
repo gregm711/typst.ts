@@ -1371,10 +1371,11 @@ impl TypstCompileWorld {
     fn collect_line_boxes(&self, doc: &TypstPagedDocument) -> Vec<LineBox> {
         use ::typst::World;
 
-        console_log(format!(
-            "[collect_line_boxes] Starting, {} pages",
-            doc.pages.len()
-        ));
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // console_log(format!(
+        //     "[collect_line_boxes] Starting, {} pages",
+        //     doc.pages.len()
+        // ));
 
         let world = &self.graph.snap.world;
         let main_id = world.main();
@@ -1387,17 +1388,18 @@ impl TypstCompileWorld {
 
         for (page_idx, page) in doc.pages.iter().enumerate() {
             let page_hint = page.frame.content_hint();
-            console_log(format!(
-                "[collect_line_boxes] Page {} frame: size=({:.2}, {:.2})pt, hint=0x{:02x}, items={}",
-                page_idx,
-                page.frame.width().to_pt(),
-                page.frame.height().to_pt(),
-                page_hint as u32,
-                page.frame.items().len()
-            ));
+            // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+            // console_log(format!(
+            //     "[collect_line_boxes] Page {} frame: size=({:.2}, {:.2})pt, hint=0x{:02x}, items={}",
+            //     page_idx,
+            //     page.frame.width().to_pt(),
+            //     page.frame.height().to_pt(),
+            //     page_hint as u32,
+            //     page.frame.items().len()
+            // ));
 
-            // Debug: Print top-level frame hierarchy to understand structure
-            Self::debug_print_frame_tree(&page.frame, 0, 5);
+            // DEBUG: debug_print_frame_tree DISABLED - was printing entire frame tree recursively
+            // Self::debug_print_frame_tree(&page.frame, 0, 5);
 
             Self::collect_lines_from_frame(
                 page_idx as u32,
@@ -1408,10 +1410,11 @@ impl TypstCompileWorld {
             );
         }
 
-        console_log(format!(
-            "[collect_line_boxes] Found {} line boxes total",
-            lines.len()
-        ));
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // console_log(format!(
+        //     "[collect_line_boxes] Found {} line boxes total",
+        //     lines.len()
+        // ));
 
         // Sort by page, then by Y position (top)
         lines.sort_by(|a, b| {
@@ -1473,11 +1476,12 @@ impl TypstCompileWorld {
             }
         }
 
-        console_log(format!(
-            "[collect_glyph_maps] Collected {} pages with glyph maps (filter={:?})",
-            page_maps.len(),
-            page_filter.map(|f| f.len())
-        ));
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // console_log(format!(
+        //     "[collect_glyph_maps] Collected {} pages with glyph maps (filter={:?})",
+        //     page_maps.len(),
+        //     page_filter.map(|f| f.len())
+        // ));
 
         page_maps
     }
@@ -1510,28 +1514,8 @@ impl TypstCompileWorld {
                             if let Some(raw) = NonZeroU64::new(span.into_raw().get()) {
                                 let span_id = format!("{:x}", raw.get());
 
-                                // Debug: Count how many times we've seen this span_id already
-                                let existing_count = result.iter().filter(|m| m.span_id == span_id).count();
-
-                                // ALWAYS log for debugging wrapped text issues
-                                // Check if all glyphs share the same SourceSpan or if they differ
-                                let mut unique_spans = std::collections::HashSet::new();
-                                for g in text.glyphs.iter() {
-                                    if let Some(r) = NonZeroU64::new(g.span.0.into_raw().get()) {
-                                        unique_spans.insert(r.get());
-                                    }
-                                }
-
-                                console_log(format!(
-                                    "[GlyphMap] span={} pos=({:.1},{:.1}) glyphs={} unique_glyph_spans={} existing_chunks={} first_local_offset={}",
-                                    &span_id[..8.min(span_id.len())],
-                                    pos.x.to_pt(),
-                                    pos.y.to_pt(),
-                                    text.glyphs.len(),
-                                    unique_spans.len(),
-                                    existing_count,
-                                    first_glyph.span.1
-                                ));
+                                // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+                                // Carmack says: never log in hot paths
 
                                 // Collect byte offsets for each glyph
                                 // IMPORTANT: Each glyph has its own span info (span.0 = SourceSpan, span.1 = local offset)
@@ -1548,32 +1532,13 @@ impl TypstCompileWorld {
                                     // If we can't resolve the span, we skip this entire text item
                                     if let Some(range) = source.range(glyph_span) {
                                         let byte_pos = range.start + local_offset;
-
-                                        // Debug first few glyphs
-                                        if idx < 3 || idx == text.glyphs.len() - 1 {
-                                            let glyph_span_raw = NonZeroU64::new(glyph_span.into_raw().get())
-                                                .map(|r| format!("{:x}", r.get()))
-                                                .unwrap_or_else(|| "detached".to_string());
-                                            console_log(format!(
-                                                "[GlyphMap] span={} glyph[{}]: local_offset={}, byte_pos={}, glyph_span={}",
-                                                &span_id[..8.min(span_id.len())],
-                                                idx,
-                                                local_offset,
-                                                byte_pos,
-                                                &glyph_span_raw[..8.min(glyph_span_raw.len())]
-                                            ));
-                                        }
-
+                                        // DEBUG LOGGING DISABLED for per-glyph output
                                         byte_offsets.push(byte_pos);
                                     } else {
                                         // Can't resolve this glyph's span - skip entire text item
                                         // to avoid emitting partial/incorrect data
                                         all_resolved = false;
-                                        console_log(format!(
-                                            "[GlyphMap] span={} glyph[{}]: UNRESOLVED span, skipping text item",
-                                            &span_id[..8.min(span_id.len())],
-                                            idx
-                                        ));
+                                        // DEBUG LOGGING DISABLED
                                         break;
                                     }
                                 }
@@ -1602,10 +1567,7 @@ impl TypstCompileWorld {
                                         byte_offsets.push(end_byte);
                                     } else {
                                         // Can't resolve end position - skip this text item
-                                        console_log(format!(
-                                            "[GlyphMap] span={}: UNRESOLVED end span, skipping",
-                                            &span_id[..8.min(span_id.len())]
-                                        ));
+                                        // DEBUG LOGGING DISABLED
                                         continue;
                                     }
                                 } else {
@@ -1643,13 +1605,14 @@ impl TypstCompileWorld {
             String::new()
         };
 
-        console_log(format!(
-            "{}Frame h={:.1}pt items={}{}",
-            indent,
-            frame.height().to_pt(),
-            frame.items().len(),
-            hint_str
-        ));
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // console_log(format!(
+        //     "{}Frame h={:.1}pt items={}{}",
+        //     indent,
+        //     frame.height().to_pt(),
+        //     frame.items().len(),
+        //     hint_str
+        // ));
 
         for (pos, item) in frame.items() {
             match item {
@@ -1662,29 +1625,31 @@ impl TypstCompileWorld {
                         String::new()
                     };
 
-                    if depth < 3 || child_hint != '\0' {
-                        console_log(format!(
-                            "{}  Group @({:.1},{:.1}) t=({:.2},{:.2}){}",
-                            indent,
-                            pos.x.to_pt(),
-                            pos.y.to_pt(),
-                            t.tx.to_pt(),
-                            t.ty.to_pt(),
-                            child_hint_str
-                        ));
-                    }
+                    // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+                    // if depth < 3 || child_hint != '\0' {
+                    //     console_log(format!(
+                    //         "{}  Group @({:.1},{:.1}) t=({:.2},{:.2}){}",
+                    //         indent,
+                    //         pos.x.to_pt(),
+                    //         pos.y.to_pt(),
+                    //         t.tx.to_pt(),
+                    //         t.ty.to_pt(),
+                    //         child_hint_str
+                    //     ));
+                    // }
 
                     Self::debug_print_frame_tree(&group.frame, depth + 1, max_depth);
                 }
-                FrameItem::Text(text) if depth < 3 => {
-                    console_log(format!(
-                        "{}  Text @({:.1},{:.1}) {} glyphs",
-                        indent,
-                        pos.x.to_pt(),
-                        pos.y.to_pt(),
-                        text.glyphs.len()
-                    ));
-                }
+                // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+                // FrameItem::Text(text) if depth < 3 => {
+                //     console_log(format!(
+                //         "{}  Text @({:.1},{:.1}) {} glyphs",
+                //         indent,
+                //         pos.x.to_pt(),
+                //         pos.y.to_pt(),
+                //         text.glyphs.len()
+                //     ));
+                // }
                 _ => {}
             }
         }
@@ -1733,23 +1698,25 @@ impl TypstCompileWorld {
                 FrameItem::Group(group) => {
                     let gt = &group.transform;
 
+                    // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
                     // Debug: log the path to first line only
-                    if out.is_empty() {
-                        let depth = DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if depth < 10 {
-                            let has_hint = group.frame.content_hint() != '\0';
-                            console_log(format!(
-                                "[Traverse d={}] pos=({:.2}, {:.2})pt → ty={:.2}pt | gt=({:.4}, {:.2})pt | is_line={}",
-                                depth,
-                                pos.x.to_pt(),
-                                pos.y.to_pt(),
-                                child_transform.pos_y(),
-                                gt.sy.get(),
-                                gt.ty.to_pt(),
-                                has_hint
-                            ));
-                        }
-                    }
+                    // if out.is_empty() {
+                    //     let depth = DEPTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    //     if depth < 10 {
+                    //         let has_hint = group.frame.content_hint() != '\0';
+                    //         console_log(format!(
+                    //             "[Traverse d={}] pos=({:.2}, {:.2})pt → ty={:.2}pt | gt=({:.4}, {:.2})pt | is_line={}",
+                    //             depth,
+                    //             pos.x.to_pt(),
+                    //             pos.y.to_pt(),
+                    //             child_transform.pos_y(),
+                    //             gt.sy.get(),
+                    //             gt.ty.to_pt(),
+                    //             has_hint
+                    //         ));
+                    //     }
+                    // }
+                    let _ = gt; // silence unused warning
 
                     // Apply the group's transform (pre_concat like typst2vec)
                     let group_transform = child_transform.pre_concat(&group.transform);
@@ -1776,25 +1743,27 @@ impl TypstCompileWorld {
 
         if child_lines_added {
             // This frame marks a block, but nested frames contained the real lines.
-            if out.len() < 3 {
-                console_log(format!(
-                    "[LineFrame CONTAINER] hint='{}' (0x{:02x}) - used child line frames",
-                    if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
-                    hint as u32,
-                ));
-            }
+            // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+            // if out.len() < 3 {
+            //     console_log(format!(
+            //         "[LineFrame CONTAINER] hint='{}' (0x{:02x}) - used child line frames",
+            //         if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
+            //         hint as u32,
+            //     ));
+            // }
             return;
         }
 
         // No child line frames were found; treat this frame as the leaf candidate.
-        if out.len() < 3 {
-            console_log(format!(
-                "[LineFrame LEAF] hint='{}' (0x{:02x}), transform.ty={:.2}pt",
-                if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
-                hint as u32,
-                transform.pos_y()
-            ));
-        }
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // if out.len() < 3 {
+        //     console_log(format!(
+        //         "[LineFrame LEAF] hint='{}' (0x{:02x}), transform.ty={:.2}pt",
+        //         if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
+        //         hint as u32,
+        //         transform.pos_y()
+        //     ));
+        // }
 
         // Hybrid Approach: verify content geometrically.
         let mut text_infos = Vec::new();
@@ -1871,15 +1840,16 @@ impl TypstCompileWorld {
 
         let cluster_count = clusters.len();
         // Log if we emit lines
-        if out.len() < 5 {
-            console_log(format!(
-                "[LineFrame LOOSE] hint='{}' (0x{:02x}) -> {} lines (tolerance={:.2})",
-                if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
-                hint as u32,
-                cluster_count,
-                tolerance
-            ));
-        }
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // if out.len() < 5 {
+        //     console_log(format!(
+        //         "[LineFrame LOOSE] hint='{}' (0x{:02x}) -> {} lines (tolerance={:.2})",
+        //         if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },
+        //         hint as u32,
+        //         cluster_count,
+        //         tolerance
+        //     ));
+        // }
 
         // Emit LineBoxes for each cluster
         for (i, cluster) in clusters.into_iter().enumerate() {
@@ -1893,18 +1863,19 @@ impl TypstCompileWorld {
             let height = (max_y - min_y) as f32;
             let top = min_y as f32;
 
-            if out.len() < 5 {
-                console_log(format!(
-                    "[LineBox #{}] Cluster {}/{} top={:.2}pt h={:.2}pt bytes={}..{}",
-                    out.len(),
-                    i + 1,
-                    cluster_count,
-                    top,
-                    height,
-                    start_byte,
-                    end_byte
-                ));
-            }
+            // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+            // if out.len() < 5 {
+            //     console_log(format!(
+            //         "[LineBox #{}] Cluster {}/{} top={:.2}pt h={:.2}pt bytes={}..{}",
+            //         out.len(),
+            //         i + 1,
+            //         cluster_count,
+            //         top,
+            //         height,
+            //         start_byte,
+            //         end_byte
+            //     ));
+            // }
 
             out.push(LineBox {
                 page,

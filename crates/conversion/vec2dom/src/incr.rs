@@ -180,9 +180,10 @@ impl IncrDomDocClient {
                         })
                         .into());
                     }
-                    web_sys::console::log_1(
-                        &format!("canvas state prepare done: {page_num}").into(),
-                    );
+                    // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+                    // web_sys::console::log_1(
+                    //     &format!("canvas state prepare done: {page_num}").into(),
+                    // );
                 }
             }
             STAGE_CANVAS => {
@@ -296,22 +297,24 @@ impl IncrDomDocClient {
 
         let mut dirty = self.doc_view.len() != pages_count;
 
-        web_sys::console::log_1(
-            &format!(
-                "[retrack_pages] doc_view.len={} pages_count={} initial_dirty={}",
-                self.doc_view.len(),
-                pages_count,
-                dirty
-            )
-            .into(),
-        );
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "[retrack_pages] doc_view.len={} pages_count={} initial_dirty={}",
+        //         self.doc_view.len(),
+        //         pages_count,
+        //         dirty
+        //     )
+        //     .into(),
+        // );
 
         // Tracks the pages.
         if self.doc_view.len() > pages_count {
             self.doc_view.truncate(pages_count);
         }
         for i in self.doc_view.len()..pages_count {
-            web_sys::console::log_1(&format!("[retrack_pages] Creating new DomPage at index {}", i).into());
+            // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+            // web_sys::console::log_1(&format!("[retrack_pages] Creating new DomPage at index {}", i).into());
             self.doc_view
                 .push(DomPage::new_at(elem.hooked.clone(), self.tmpl.clone(), i));
         }
@@ -319,15 +322,16 @@ impl IncrDomDocClient {
         // Get pages again for tracking (borrow ended above)
         {
             let pages = self.checkout_pages(kern);
-            for (idx, (page, data)) in self.doc_view.iter_mut().zip(pages).enumerate() {
+            for (_idx, (page, data)) in self.doc_view.iter_mut().zip(pages).enumerate() {
                 let sub_dirty = page.track_data(data, layout_version);
-                web_sys::console::log_1(
-                    &format!(
-                        "[retrack_pages] Page {} track_data returned dirty={} (layout_version={})",
-                        idx, sub_dirty, layout_version
-                    )
-                    .into(),
-                );
+                // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+                // web_sys::console::log_1(
+                //     &format!(
+                //         "[retrack_pages] Page {} track_data returned dirty={} (layout_version={})",
+                //         _idx, sub_dirty, layout_version
+                //     )
+                //     .into(),
+                // );
                 dirty = dirty || sub_dirty;
             }
         }

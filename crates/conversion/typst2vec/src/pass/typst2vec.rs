@@ -734,6 +734,36 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                                     state.page_transform,
                                 );
 
+                                // Calculate glyph Y bounds from font metrics (not just baseline).
+                                // This ensures y_min != y_max for proper multi-line span hit testing.
+                                let (glyph_y_min, glyph_y_max) = {
+                                    let bb_opt = text.font.ttf().glyph_bounding_box(ttf_parser::GlyphId(glyph.id));
+                                    // Check if we have a valid bounding box with non-zero height
+                                    let use_bb = bb_opt.map_or(false, |bb| bb.y_min != bb.y_max);
+
+                                    if let (true, Some(bb)) = (use_bb, bb_opt) {
+                                        let pos = cursor + offset;
+                                        let a_y = pos.y + text.font.to_em(bb.y_min).at(text.size);
+                                        let b_y = pos.y + text.font.to_em(bb.y_max).at(text.size);
+                                        // Convert to frame coordinates (y-down) and transform to page space
+                                        let y_lo = -(a_y.max(b_y)).to_pt() as f32;
+                                        let y_hi = -(a_y.min(b_y)).to_pt() as f32;
+                                        let lo_point = transform_point(
+                                            Point::new(Scalar(0.0), Scalar(y_lo)),
+                                            state.page_transform,
+                                        );
+                                        let hi_point = transform_point(
+                                            Point::new(Scalar(0.0), Scalar(y_hi)),
+                                            state.page_transform,
+                                        );
+                                        (lo_point.y.0.min(hi_point.y.0), lo_point.y.0.max(hi_point.y.0))
+                                    } else {
+                                        // Fallback: estimate from font size if no bounding box or zero-height box
+                                        let font_size = text.size.to_pt() as f32;
+                                        (start_point.y.0 - font_size * 0.8, start_point.y.0 + font_size * 0.2)
+                                    }
+                                };
+
                                 // Initialize with infinity/neg-infinity so min/max work correctly
                                 let entry = per_span_glyphs
                                     .entry(id)
@@ -744,8 +774,9 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                                 // Track bounds: min/max of all glyph start/end positions
                                 entry.3 = entry.3.min(start_point.x.0).min(end_point.x.0); // x_min
                                 entry.4 = entry.4.max(start_point.x.0).max(end_point.x.0); // x_max
-                                entry.5 = entry.5.min(start_point.y.0).min(end_point.y.0); // y_min
-                                entry.6 = entry.6.max(start_point.y.0).max(end_point.y.0); // y_max
+                                // Use glyph bounding box Y (not baseline) for y_min/y_max
+                                entry.5 = entry.5.min(glyph_y_min); // y_min
+                                entry.6 = entry.6.max(glyph_y_max); // y_max
                             }
 
                             cursor += advance;

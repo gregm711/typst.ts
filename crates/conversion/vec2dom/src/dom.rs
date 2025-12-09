@@ -132,16 +132,18 @@ impl DomPage {
         let is_same = self.layout_data.as_ref() == Some(data);
         let is_same_version = self.layout_version == layout_version;
 
-        web_sys::console::log_1(
-            &format!(
-                "[track_data] page:{idx} is_same={is_same} same_version={same_version} layout_data_is_some={ld_some} data_content={data_content:?}",
-                idx = self.idx,
-                ld_some = self.layout_data.is_some(),
-                same_version = is_same_version,
-                data_content = data.content,
-            )
-            .into(),
-        );
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "[track_data] page:{idx} is_same={is_same} same_version={same_version} layout_data_is_some={ld_some} data_content={data_content:?}",
+        //         idx = self.idx,
+        //         ld_some = self.layout_data.is_some(),
+        //         same_version = is_same_version,
+        //         data_content = data.content,
+        //     )
+        //     .into(),
+        // );
+        let _ = is_same_version; // silence unused warning
 
         if is_same && is_same_version {
             return false;
@@ -152,13 +154,14 @@ impl DomPage {
         *self.realized.lock().unwrap() = None;
         self.layout_version = layout_version;
 
-        web_sys::console::log_1(
-            &format!(
-                "[track_data] page:{idx} SET dirty_layout and cleared realized (layout_version={layout_version})",
-                idx = self.idx,
-            )
-            .into(),
-        );
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "[track_data] page:{idx} SET dirty_layout and cleared realized (layout_version={layout_version})",
+        //         idx = self.idx,
+        //     )
+        //     .into(),
+        // );
 
         true
     }
@@ -229,24 +232,26 @@ impl DomPage {
 
     /// Returns true if layout work was performed (dirty_layout was present)
     pub fn relayout(&mut self, ctx: &CanvasBackend) -> Result<bool> {
-        let has_dirty = self.dirty_layout.is_some();
-        web_sys::console::log_1(
-            &format!(
-                "[relayout] page:{idx} has_dirty_layout={has_dirty}",
-                idx = self.idx,
-            )
-            .into(),
-        );
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // let has_dirty = self.dirty_layout.is_some();
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "[relayout] page:{idx} has_dirty_layout={has_dirty}",
+        //         idx = self.idx,
+        //     )
+        //     .into(),
+        // );
 
         if let Some(data) = self.dirty_layout.take() {
-            web_sys::console::log_1(
-                &format!(
-                    "[relayout] page:{} calling do_relayout with data.content={:?}",
-                    self.idx,
-                    data.content,
-                )
-                .into(),
-            );
+            // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+            // web_sys::console::log_1(
+            //     &format!(
+            //         "[relayout] page:{} calling do_relayout with data.content={:?}",
+            //         self.idx,
+            //         data.content,
+            //     )
+            //     .into(),
+            // );
             self.do_relayout(ctx, data)?;
             Ok(true)
         } else {
@@ -346,24 +351,24 @@ impl DomPage {
         let realized_is_none = self.realized.lock().unwrap().is_none();
         let needs_render = has_dirty_layout || realized_is_none;
 
-        // Always log for debugging
-        web_sys::console::log_1(
-            &format!(
-                "[need_repaint_svg] page:{idx} bbox=({bx1:.1},{by1:.1})-({bx2:.1},{by2:.1}) viewport=({vx1:.1},{vy1:.1})-({vx2:.1},{vy2:.1}) intersection_empty={int_empty} visible:{should_visible} dirty:{has_dirty_layout} realized_none:{realized_is_none} -> needs_render:{needs_render} result:{result}",
-                idx = self.idx,
-                bx1 = self.bbox.lo.x.0,
-                by1 = self.bbox.lo.y.0,
-                bx2 = self.bbox.hi.x.0,
-                by2 = self.bbox.hi.y.0,
-                vx1 = self.viewport.lo.x.0,
-                vy1 = self.viewport.lo.y.0,
-                vx2 = self.viewport.hi.x.0,
-                vy2 = self.viewport.hi.y.0,
-                int_empty = intersection.is_empty(),
-                result = should_visible && needs_render,
-            )
-            .into(),
-        );
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // web_sys::console::log_1(
+        //     &format!(
+        //         "[need_repaint_svg] page:{idx} bbox=({bx1:.1},{by1:.1})-({bx2:.1},{by2:.1}) viewport=({vx1:.1},{vy1:.1})-({vx2:.1},{vy2:.1}) intersection_empty={int_empty} visible:{should_visible} dirty:{has_dirty_layout} realized_none:{realized_is_none} -> needs_render:{needs_render} result:{result}",
+        //         idx = self.idx,
+        //         bx1 = self.bbox.lo.x.0,
+        //         by1 = self.bbox.lo.y.0,
+        //         bx2 = self.bbox.hi.x.0,
+        //         by2 = self.bbox.hi.y.0,
+        //         vx1 = self.viewport.lo.x.0,
+        //         vy1 = self.viewport.lo.y.0,
+        //         vx2 = self.viewport.hi.x.0,
+        //         vy2 = self.viewport.hi.y.0,
+        //         int_empty = intersection.is_empty(),
+        //         result = should_visible && needs_render,
+        //     )
+        //     .into(),
+        // );
 
         self.change_svg_visibility(should_visible);
         // Only repaint if visible AND there's actual work to do
@@ -489,7 +494,8 @@ impl DomPage {
         }
 
         let data = self.layout_data.clone().unwrap();
-        web_sys::console::log_1(&format!("layout heavy semantics: {} {:?}", self.idx, data).into());
+        // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
+        // web_sys::console::log_1(&format!("layout heavy semantics: {} {:?}", self.idx, data).into());
 
         let output = ctx.semantics_backend.render(ctx.module, &data, true);
         self.semantics.set_inner_html(&output);
