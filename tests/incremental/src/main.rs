@@ -507,4 +507,146 @@ Hello world!
         }
     }
 
+    /// Test that numbered list items with mixed styled/plain text get full glyph coverage.
+    ///
+    /// This tests the fix for synthetic span remapping where plain text after bold
+    /// list markers (e.g., "+ *Bold*: Plain text") was not getting glyph positions.
+    #[test]
+    fn list_item_glyph_coverage_matches_byte_offsets() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+
+        // Numbered list with bold headings followed by plain text (mimics the test-editor content)
+        let source = r#"
+#set page(width: 400pt, height: 200pt, margin: 10pt)
+
++ *Manual Typesetting*: Physical type composition
++ *Desktop Publishing*: WYSIWYG editors emerge
++ *Web-Based Tools*: Collaborative platforms
+"#;
+
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc));
+        let glyph_map = delta.glyph_map;
+
+        assert!(
+            !glyph_map.is_empty(),
+            "glyph_map should contain at least one page"
+        );
+
+        let page0 = &glyph_map[0];
+
+        // Count total glyph positions across all spans
+        let total_positions: usize = page0.spans.iter()
+            .map(|run| run.glyph_spans.len())
+            .sum();
+
+        // The source has roughly:
+        // - 3 list markers (1., 2., 3.) - synthetic but should be mapped
+        // - "*Manual Typesetting*" (18 chars) + ": Physical type composition" (28 chars)
+        // - "*Desktop Publishing*" (18 chars) + ": WYSIWYG editors emerge" (24 chars)
+        // - "*Web-Based Tools*" (15 chars) + ": Collaborative platforms" (26 chars)
+        // Total visible chars ~130+
+
+        // We expect at least 100 glyph positions (allowing for ligatures etc)
+        assert!(
+            total_positions >= 100,
+            "expected at least 100 glyph positions for list content, got {}. \
+             This indicates synthetic spans or plain text after bold may be missing coverage.",
+            total_positions
+        );
+
+        // Verify each span has reasonable coverage (positions should be close to glyph count)
+        for run in &page0.spans {
+            let glyph_count = run.glyph_spans.len();
+            let position_count = run.positions.len();
+
+            // positions should be glyph_count + 1 (for trailing edge)
+            assert_eq!(
+                position_count,
+                glyph_count + 1,
+                "span {} has {} glyphs but {} positions (expected {})",
+                run.span,
+                glyph_count,
+                position_count,
+                glyph_count + 1
+            );
+        }
+
+        // Check that we have multiple spans (not everything collapsed into one)
+        assert!(
+            page0.spans.len() >= 3,
+            "expected at least 3 spans for list with 3 items, got {}",
+            page0.spans.len()
+        );
+    }
+
+    /// Test that plain text following bold/emphasized text in list items gets glyph positions.
+    ///
+    /// The bug: glyphMaps correctly assigns byte offsets, but glyphPositions uses
+    /// different span IDs causing a mismatch after the coverage filter.
+    #[test]
+    fn plain_text_after_emphasis_has_glyph_positions() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+
+        // Simple case: bold followed by plain text
+        let source = r#"
+#set page(width: 300pt, height: 100pt, margin: 10pt)
+
+*Bold text*: followed by plain text here
+"#;
+
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc));
+        let glyph_map = delta.glyph_map;
+
+        assert!(!glyph_map.is_empty(), "should have glyph map");
+        let page0 = &glyph_map[0];
+
+        // The text "followed by plain text here" has ~28 characters
+        // We need to verify it has glyph positions, not just 2 positions (colon only)
+
+        // Find spans that cover positions after x=100pt (roughly where the colon would be)
+        let spans_with_good_coverage: Vec<_> = page0.spans.iter()
+            .filter(|run| {
+                // Check if span has more than just a couple glyphs
+                run.glyph_spans.len() > 5
+            })
+            .collect();
+
+        // Should have at least 2 spans with good coverage:
+        // 1. The bold text "*Bold text*"
+        // 2. The plain text ": followed by plain text here"
+        assert!(
+            spans_with_good_coverage.len() >= 2,
+            "expected at least 2 spans with >5 glyphs (bold and plain text), got {}. \
+             Spans: {:?}",
+            spans_with_good_coverage.len(),
+            page0.spans.iter().map(|r| (r.span, r.glyph_spans.len())).collect::<Vec<_>>()
+        );
+
+        // Verify the total glyph count covers most of the text
+        let total_glyphs: usize = page0.spans.iter()
+            .map(|r| r.glyph_spans.len())
+            .sum();
+
+        // "Bold text" (9) + "followed by plain text here" (28) + colon/space = ~40 chars minimum
+        assert!(
+            total_glyphs >= 35,
+            "expected at least 35 total glyphs, got {}. Plain text may be missing.",
+            total_glyphs
+        );
+    }
+
 }

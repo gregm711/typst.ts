@@ -1020,6 +1020,32 @@ impl TypstCompileWorld {
         // Serialize line boxes for cursor height consistency
         let line_boxes_js = serde_wasm_bindgen::to_value(&line_boxes).unwrap_or(JsValue::NULL);
 
+        // Filter glyph positions by page if filter is active
+        let glyph_positions = if let Some(filter) = &page_filter {
+            delta.glyph_map.iter()
+                .filter(|gp| filter.contains(&gp.page))
+                .cloned()
+                .collect::<Vec<_>>()
+        } else {
+            delta.glyph_map.clone()
+        };
+
+        // Keep glyph positions/layout coherent with glyph maps: only emit spans that
+        // have byte offsets. This prevents orphan spans (e.g., generated content) from
+        // reaching the client.
+        let span_ids: std::collections::HashSet<String> = glyph_maps
+            .iter()
+            .flat_map(|page| page.spans.iter().map(|s| s.span_id.clone()))
+            .collect();
+
+        let filtered_glyph_positions = glyph_positions
+            .into_iter()
+            .map(|mut page| {
+                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page
+            })
+            .collect::<Vec<_>>();
+
         // Serialize glyph maps for accurate click positioning
         let glyph_maps_js = match serde_wasm_bindgen::to_value(&glyph_maps) {
             Ok(v) => {
@@ -1036,19 +1062,9 @@ impl TypstCompileWorld {
             }
         };
 
-        // Filter glyph positions by page if filter is active
-        let glyph_positions = if let Some(filter) = &page_filter {
-            delta.glyph_map.iter()
-                .filter(|gp| filter.contains(&gp.page))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            delta.glyph_map.clone()
-        };
-
         // Serialize glyph positions from typst2vec lowering (page-space x positions).
         let glyph_positions_js =
-            serde_wasm_bindgen::to_value(&glyph_positions).unwrap_or(JsValue::NULL);
+            serde_wasm_bindgen::to_value(&filtered_glyph_positions).unwrap_or(JsValue::NULL);
 
         // Collect syntax nodes for editor protection (headings, lists, math, etc.)
         let syntax_nodes = self.collect_syntax_nodes();
@@ -1064,8 +1080,19 @@ impl TypstCompileWorld {
             delta.layout_map.clone()
         };
 
+        // Apply the SAME span_ids filter to layoutMap that we apply to glyphPositions
+        // This ensures layoutMap and glyphPositions have matching spans, preventing
+        // orphan spans (e.g., generated content) that have no glyph data from reaching the client
+        let filtered_layout_map = layout_map
+            .into_iter()
+            .map(|mut page| {
+                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page
+            })
+            .collect::<Vec<_>>();
+
         let layout_map_js =
-            serde_wasm_bindgen::to_value(&layout_map).unwrap_or(JsValue::NULL);
+            serde_wasm_bindgen::to_value(&filtered_layout_map).unwrap_or(JsValue::NULL);
 
         // Log filtering info
         if let Some(filter) = &page_filter {
@@ -1073,8 +1100,8 @@ impl TypstCompileWorld {
                 "[incr_compile] Page filter active: {} pages requested, {} total pages. Returning {} glyph_positions, {} layout_map entries",
                 filter.len(),
                 total_page_count,
-                glyph_positions.len(),
-                layout_map.len()
+                filtered_glyph_positions.len(),
+                filtered_layout_map.len()
             ));
         }
 
@@ -1491,6 +1518,15 @@ impl TypstCompileWorld {
     /// IMPORTANT: When text wraps to multiple lines, Typst creates multiple
     /// FrameItem::Text entries with the SAME span_id but at different Y positions.
     /// The client groups these by spanId into "chunks" for proper cursor placement.
+    ///
+    /// SYNTHETIC SPAN HANDLING (Buffer-and-Flush):
+    /// Detached spans (list markers, auto-numbers, bullets) have no source mapping.
+    /// We use a two-level strategy:
+    /// 1. Within a text item: Find an "anchor" glyph (first attached) and remap
+    ///    detached siblings to that anchor.
+    /// 2. Across text items: Buffer purely synthetic text items and flush them
+    ///    when we encounter a text item with a valid span. This handles isolated
+    ///    bullets/markers that come as separate FrameItem::Text entries.
     #[cfg(feature = "incr")]
     fn collect_glyphs_from_frame(
         frame: &::typst::layout::Frame,
@@ -1500,91 +1536,145 @@ impl TypstCompileWorld {
         use ::typst::layout::FrameItem;
         use std::num::NonZeroU64;
 
-        for (pos, item) in frame.items() {
+        // Buffer for purely synthetic text items (no internal anchor)
+        // Each entry: (glyph_count, byte_offsets placeholder)
+        // We'll assign them a span_id when we find the next valid text item
+        let mut synthetic_buffer: Vec<Vec<usize>> = Vec::new();
+
+        // Last seen valid span info for fallback (if frame ends with synthetics)
+        let mut last_valid_span: Option<(String, usize)> = None; // (span_id, start_byte)
+
+        for (_pos, item) in frame.items() {
             match item {
                 FrameItem::Group(group) => {
+                    // Recurse into groups - they have their own frame context
                     Self::collect_glyphs_from_frame(&group.frame, source, result);
                 }
                 FrameItem::Text(text) => {
-                    // Get the span ID from the first glyph
-                    // NOTE: For wrapped text, multiple FrameItem::Text may have the same span
-                    if let Some(first_glyph) = text.glyphs.first() {
-                        let span = first_glyph.span.0;
-                        if !span.is_detached() {
-                            if let Some(raw) = NonZeroU64::new(span.into_raw().get()) {
-                                let span_id = format!("{:x}", raw.get());
+                    // Find an "anchor" glyph - first attached (non-detached) glyph with resolvable span
+                    // Used ONLY for detached glyphs - attached glyphs keep their own span ID
+                    let anchor: Option<(u64, std::ops::Range<usize>)> = text.glyphs.iter()
+                        .find_map(|g| {
+                            let span = g.span.0;
+                            if !span.is_detached() {
+                                source.range(span).map(|range| (span.into_raw().get(), range))
+                            } else {
+                                None
+                            }
+                        });
 
-                                // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
-                                // Carmack says: never log in hot paths
+                    if let Some((anchor_raw, anchor_range)) = anchor {
+                        // This text item has a valid anchor
+                        let anchor_span_id = format!("{:x}", anchor_raw);
 
-                                // Collect byte offsets for each glyph
-                                // IMPORTANT: Each glyph has its own span info (span.0 = SourceSpan, span.1 = local offset)
-                                // We need to resolve each glyph's absolute byte position individually
-                                let mut byte_offsets: Vec<usize> = Vec::with_capacity(text.glyphs.len() + 1);
+                        // FLUSH: Assign buffered synthetic items to the anchor span
+                        for buffered_offsets in synthetic_buffer.drain(..) {
+                            result.push(SpanGlyphMap {
+                                span_id: anchor_span_id.clone(),
+                                byte_offsets: buffered_offsets,
+                            });
+                        }
 
-                                let mut all_resolved = true;
-                                for (idx, glyph) in text.glyphs.iter().enumerate() {
-                                    // Each glyph has its own span and local offset
-                                    let glyph_span = glyph.span.0;
-                                    let local_offset = glyph.span.1 as usize;
+                        // Process this text item's glyphs - GROUP BY SPAN ID
+                        // This matches typst2vec.rs behavior where each glyph uses its own span
+                        // (or anchor for detached glyphs)
+                        use std::collections::HashMap;
+                        let mut per_span_offsets: HashMap<u64, Vec<usize>> = HashMap::new();
+                        let mut last_resolved_byte: Option<usize> = None;
+                        let mut last_span_id: Option<u64> = None;
 
-                                    // Get absolute byte position for this glyph - NO HEURISTICS
-                                    // If we can't resolve the span, we skip this entire text item
-                                    if let Some(range) = source.range(glyph_span) {
-                                        let byte_pos = range.start + local_offset;
-                                        // DEBUG LOGGING DISABLED for per-glyph output
-                                        byte_offsets.push(byte_pos);
-                                    } else {
-                                        // Can't resolve this glyph's span - skip entire text item
-                                        // to avoid emitting partial/incorrect data
-                                        all_resolved = false;
-                                        // DEBUG LOGGING DISABLED
-                                        break;
-                                    }
-                                }
+                        for glyph in text.glyphs.iter() {
+                            let glyph_span = glyph.span.0;
+                            let local_offset = glyph.span.1 as usize;
 
-                                // Only proceed if all glyphs were resolved
-                                if !all_resolved {
-                                    continue;
-                                }
+                            // Determine span ID - matches typst2vec.rs logic exactly
+                            let span_id = if glyph_span.is_detached() {
+                                anchor_raw  // Use anchor for detached
+                            } else {
+                                glyph_span.into_raw().get()  // Use own span for attached
+                            };
 
-                                // Add end position (byte after last glyph)
-                                // BUG FIX: We were using `range.end` which is the end of the ENTIRE
-                                // source span (e.g., byte 191 for all text items in a paragraph).
-                                // This caused overlapping byte ranges across lines, breaking
-                                // byte->chunk resolution for wrapped text.
-                                //
-                                // CORRECT: Use range.start + last_glyph.span.1 + 1
-                                // This gives the byte position AFTER the last glyph in this text item.
-                                if let Some(last_glyph) = text.glyphs.last() {
-                                    let last_span = last_glyph.span.0;
-                                    let last_local_offset = last_glyph.span.1 as usize;
-                                    if let Some(range) = source.range(last_span) {
-                                        // End position = start of span + local offset of last glyph + 1
-                                        // The +1 accounts for the glyph itself (assumes 1-byte chars;
-                                        // for multi-byte UTF-8, the next glyph's offset will be used)
-                                        let end_byte = range.start + last_local_offset + 1;
-                                        byte_offsets.push(end_byte);
-                                    } else {
-                                        // Can't resolve end position - skip this text item
-                                        // DEBUG LOGGING DISABLED
-                                        continue;
-                                    }
+                            let byte_pos = if !glyph_span.is_detached() {
+                                if let Some(range) = source.range(glyph_span) {
+                                    let pos = range.start + local_offset;
+                                    last_resolved_byte = Some(pos);
+                                    pos
                                 } else {
-                                    // No glyphs - skip
-                                    continue;
+                                    anchor_range.start
                                 }
+                            } else {
+                                // Detached glyph within mixed item: use anchor byte
+                                anchor_range.start
+                            };
 
+                            per_span_offsets.entry(span_id).or_default().push(byte_pos);
+                            last_span_id = Some(span_id);
+                        }
+
+                        // Add end position to the last span
+                        if let (Some(last_glyph), Some(last_id)) = (text.glyphs.last(), last_span_id) {
+                            let last_span = last_glyph.span.0;
+                            let last_local_offset = last_glyph.span.1 as usize;
+
+                            let end_byte = if !last_span.is_detached() {
+                                if let Some(range) = source.range(last_span) {
+                                    range.start + last_local_offset + 1
+                                } else {
+                                    last_resolved_byte.map(|b| b + 1).unwrap_or(anchor_range.start + 1)
+                                }
+                            } else {
+                                last_resolved_byte.map(|b| b + 1).unwrap_or(anchor_range.start + 1)
+                            };
+
+                            per_span_offsets.entry(last_id).or_default().push(end_byte);
+                        }
+
+                        // Emit one SpanGlyphMap per span
+                        for (span_raw, byte_offsets) in per_span_offsets {
+                            if !byte_offsets.is_empty() {
+                                let span_id = format!("{:x}", span_raw);
                                 result.push(SpanGlyphMap {
                                     span_id,
                                     byte_offsets,
                                 });
                             }
                         }
+
+                        // Update last_valid_span for end-of-frame fallback
+                        last_valid_span = Some((anchor_span_id, anchor_range.start));
+                    } else {
+                        // Purely synthetic text item - BUFFER it
+                        // Create placeholder byte offsets (all pointing to 0, will be reassigned)
+                        let mut byte_offsets: Vec<usize> = Vec::with_capacity(text.glyphs.len() + 1);
+                        for _ in 0..text.glyphs.len() {
+                            byte_offsets.push(0); // Placeholder
+                        }
+                        byte_offsets.push(0); // End position placeholder
+
+                        synthetic_buffer.push(byte_offsets);
                     }
                 }
                 _ => {}
             }
+        }
+
+        // End of frame: flush any remaining buffered synthetics to last_valid_span
+        if !synthetic_buffer.is_empty() {
+            if let Some((span_id, start_byte)) = last_valid_span {
+                for mut buffered_offsets in synthetic_buffer.drain(..) {
+                    // Assign all placeholders to the last valid span's start byte
+                    for offset in buffered_offsets.iter_mut() {
+                        *offset = start_byte;
+                    }
+                    result.push(SpanGlyphMap {
+                        span_id: span_id.clone(),
+                        byte_offsets: buffered_offsets,
+                    });
+                }
+            }
+            // If no last_valid_span exists, we have a frame with only synthetic content
+            // This is rare (e.g., a frame with only auto-generated page numbers)
+            // We drop these since there's no source location to map to
         }
     }
 

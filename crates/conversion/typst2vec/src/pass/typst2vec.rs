@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::Hash,
     sync::{atomic::AtomicU64, Arc},
 };
@@ -63,6 +63,9 @@ pub(crate) struct LayoutCollector {
     spans: Mutex<HashMap<u64, Rect>>,
     /// Stores glyph runs per span. A span may have multiple runs when text wraps across lines.
     glyphs: Mutex<HashMap<u64, Vec<GlyphRun>>>,
+    /// Orphan runs: synthetic glyphs (span == 0) captured during parallel processing.
+    /// These are resolved to their logical parent spans in a post-process pass.
+    orphans: Mutex<Vec<OrphanRun>>,
 }
 
 impl Default for LayoutCollector {
@@ -70,12 +73,13 @@ impl Default for LayoutCollector {
         Self {
             spans: Mutex::new(HashMap::new()),
             glyphs: Mutex::new(HashMap::new()),
+            orphans: Mutex::new(Vec::new()),
         }
     }
 }
 
 /// A single text run for a span. A span may have multiple runs when text wraps.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct GlyphRun {
     positions: Vec<f32>,
     glyph_spans: Vec<u64>,
@@ -85,6 +89,17 @@ struct GlyphRun {
     x_max: f32,
     y_min: f32,
     y_max: f32,
+}
+
+/// An orphan run: a synthetic glyph run (bullet, list number) with no source span.
+/// Captured during parallel processing, resolved to a parent span in post-process.
+struct OrphanRun {
+    /// Y position for spatial sorting (top of glyph bounding box)
+    y: f32,
+    /// X position for spatial sorting (left edge)
+    x: f32,
+    /// The glyph run data
+    run: GlyphRun,
 }
 
 impl LayoutCollector {
@@ -116,22 +131,135 @@ impl LayoutCollector {
         y_min: f32,
         y_max: f32,
     ) {
-        if span == 0 || positions.is_empty() {
+        if positions.is_empty() {
             return;
         }
+
+        let run = GlyphRun {
+            positions,
+            glyph_spans,
+            dir_rtl,
+            x_min,
+            x_max,
+            y_min,
+            y_max,
+        };
+
+        if span == 0 {
+            // Orphan run (synthetic glyph): capture for post-process resolution
+            self.orphans.lock().push(OrphanRun {
+                y: y_min,
+                x: x_min,
+                run,
+            });
+            return;
+        }
+
         let mut glyphs = self.glyphs.lock();
         glyphs
             .entry(span)
             .or_insert_with(Vec::new)
-            .push(GlyphRun {
-                positions,
-                glyph_spans,
-                dir_rtl,
-                x_min,
-                x_max,
-                y_min,
-                y_max,
+            .push(run);
+    }
+
+    /// Resolve orphan runs (synthetic glyphs) to their logical parent spans.
+    ///
+    /// Algorithm: "Nearest Neighbor" spatial resolution
+    /// 1. Sort orphans and valid runs by Y (primary) and X (secondary)
+    /// 2. For each orphan, look forward to find the next valid run on ~same line
+    /// 3. If found, assign orphan to that span (bullet -> text association)
+    /// 4. If not found, look backward for fallback
+    /// 5. Merge resolved orphans into the main glyphs map
+    pub(crate) fn flush_orphans(&self) {
+        let mut orphans = self.orphans.lock();
+        if orphans.is_empty() {
+            return;
+        }
+
+        let mut glyphs = self.glyphs.lock();
+
+        // Collect valid run references: (y, x, span_id)
+        let mut valid_refs: Vec<(f32, f32, u64)> = glyphs
+            .iter()
+            .flat_map(|(span, runs)| {
+                runs.iter().map(move |run| (run.y_min, run.x_min, *span))
+            })
+            .collect();
+
+        // If no valid spans exist, we can't resolve orphans - drop them
+        if valid_refs.is_empty() {
+            orphans.clear();
+            return;
+        }
+
+        // Sort valid refs by Y, then X
+        valid_refs.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        // Sort orphans by Y, then X
+        orphans.sort_by(|a, b| {
+            a.y.partial_cmp(&b.y)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
+        });
+
+        // Y tolerance for "same line" detection (roughly a line height in points)
+        const Y_TOLERANCE: f32 = 15.0;
+
+        // Resolve each orphan to a nearby valid span
+        for orphan in orphans.drain(..) {
+            let orphan_y = orphan.y;
+            let orphan_x = orphan.x;
+
+            // Look forward: find the first valid span that's:
+            // - On approximately the same line (within Y_TOLERANCE)
+            // - To the right of the orphan (typical: bullet is left of text)
+            let forward_match = valid_refs.iter().find(|(vy, vx, _)| {
+                let y_close = (vy - orphan_y).abs() < Y_TOLERANCE;
+                let x_after = *vx > orphan_x;
+                y_close && x_after
             });
+
+            // If forward match found, use it (best case: bullet -> text)
+            if let Some((_, _, span_id)) = forward_match {
+                glyphs
+                    .entry(*span_id)
+                    .or_insert_with(Vec::new)
+                    .push(orphan.run);
+                continue;
+            }
+
+            // Look backward: find any valid span on approximately the same line
+            let backward_match = valid_refs.iter().rev().find(|(vy, _, _)| {
+                (vy - orphan_y).abs() < Y_TOLERANCE
+            });
+
+            if let Some((_, _, span_id)) = backward_match {
+                glyphs
+                    .entry(*span_id)
+                    .or_insert_with(Vec::new)
+                    .push(orphan.run);
+                continue;
+            }
+
+            // Last resort: use the nearest valid span by Y distance
+            let nearest = valid_refs.iter().min_by(|a, b| {
+                let dist_a = (a.0 - orphan_y).abs();
+                let dist_b = (b.0 - orphan_y).abs();
+                dist_a.partial_cmp(&dist_b).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if let Some((_, _, span_id)) = nearest {
+                glyphs
+                    .entry(*span_id)
+                    .or_insert_with(Vec::new)
+                    .push(orphan.run);
+            }
+            // If still no match (shouldn't happen with the nearest fallback), drop the orphan
+        }
     }
 
     pub(crate) fn to_page_layout(&self, page: u32) -> PageLayout {
@@ -488,6 +616,9 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                     item: abs_ref,
                 });
 
+                // Resolve orphan runs (synthetic glyphs) before building output
+                layout.flush_orphans();
+
                 (
                     Page {
                         content: abs_ref,
@@ -512,6 +643,27 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                     acc.2.push(g);
                     acc
                 });
+
+        // Keep only spans that are present in glyph_map (resolvable spans).
+        let valid_spans: HashSet<u64> = glyph_map
+            .iter()
+            .flat_map(|p| p.spans.iter().map(|s| s.span))
+            .collect();
+
+        let layout_map = layout_map
+            .into_iter()
+            .map(|mut page| {
+                page.spans.retain(|s| valid_spans.contains(&s.span));
+                page
+            })
+            .collect();
+
+        debug_assert!(
+            glyph_map
+                .iter()
+                .all(|p| p.spans.iter().all(|s| valid_spans.contains(&s.span))),
+            "glyphPositions should only contain spans with corresponding glyph map coverage"
+        );
 
         (pages, layout_map, glyph_map)
     }
@@ -660,6 +812,17 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                         let mut per_span_glyphs: HashMap<u64, (Vec<f32>, Vec<u64>, Option<f32>, f32, f32, f32, f32)> =
                             HashMap::new();
 
+                        // Find an "anchor" span - first non-detached glyph in this text item.
+                        // Used to give synthetic (detached) glyphs a valid span ID so they
+                        // remain clickable. This matches the logic in collect_glyphs_from_frame.
+                        //
+                        // For purely synthetic text items (no anchor), we use span ID 0.
+                        // These will be captured as orphans and resolved in flush_orphans().
+                        let anchor_id: u64 = text.glyphs.iter()
+                            .find(|g| !g.span.0.is_detached())
+                            .map(|g| g.span.0.into_raw().get())
+                            .unwrap_or(0); // Use 0 for purely synthetic items (orphans)
+
                         for glyph in &text.glyphs {
                             let advance = TypstPoint::new(
                                 glyph.x_advance.at(text.size),
@@ -670,7 +833,14 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
                                 glyph.y_offset.at(text.size),
                             );
 
-                            let id = glyph.span.0.into_raw().get();
+                            // For detached (synthetic) glyphs, use the anchor span ID
+                            // This makes list markers, bullets, auto-numbers clickable
+                            let span = glyph.span.0;
+                            let id = if span.is_detached() {
+                                anchor_id
+                            } else {
+                                span.into_raw().get()
+                            };
 
                             if let Some(bb) =
                                 text.font.ttf().glyph_bounding_box(ttf_parser::GlyphId(glyph.id))

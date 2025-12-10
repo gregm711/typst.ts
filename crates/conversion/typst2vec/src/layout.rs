@@ -33,6 +33,7 @@ pub struct SpanGlyphPositions {
     /// X positions of glyph edges in page space, sorted in visual order.
     pub positions: Vec<f32>,
     /// Span ids for each glyph (mirrors Typst glyph span ids to resolve source).
+    #[serde(serialize_with = "crate::layout::serialize_spans_hex")]
     pub glyph_spans: Vec<u64>,
     /// True if the run is right-to-left.
     pub dir_rtl: bool,
@@ -49,6 +50,107 @@ pub struct SpanGlyphPositions {
 pub struct PageGlyphPositions {
     pub page: u32,
     pub spans: Vec<SpanGlyphPositions>,
+}
+
+/// Ensure that glyphMaps (byte offsets) cover all spans emitted in glyphPositions
+/// for multi-page documents. This catches cases where generated/derived spans
+/// (e.g., heading numbers) appear in glyphPositions but have no corresponding
+/// byte-offset data.
+#[cfg(test)]
+mod glyphmap_coverage_tests {
+    use super::PageGlyphPositions;
+    use serde_json::json;
+
+    /// Build a mock PageGlyphPositions with spans on multiple pages.
+    fn make_glyph_positions() -> Vec<PageGlyphPositions> {
+        vec![
+            PageGlyphPositions {
+                page: 0,
+                spans: vec![
+                    super::SpanGlyphPositions {
+                        span: 0x1000,
+                        run_index: 0,
+                        positions: vec![0.0, 10.0],
+                        glyph_spans: vec![0x1000, 0x1000],
+                        dir_rtl: false,
+                        x_min: 0.0,
+                        x_max: 10.0,
+                        y_min: 0.0,
+                        y_max: 10.0,
+                    },
+                ],
+            },
+            PageGlyphPositions {
+                page: 1,
+                spans: vec![
+                    // Page 1 has a span 0x2000 that MUST be covered by glyphMaps
+                    super::SpanGlyphPositions {
+                        span: 0x2000,
+                        run_index: 0,
+                        positions: vec![0.0, 10.0],
+                        glyph_spans: vec![0x2000, 0x2000],
+                        dir_rtl: false,
+                        x_min: 0.0,
+                        x_max: 10.0,
+                        y_min: 0.0,
+                        y_max: 10.0,
+                    },
+                ],
+            },
+        ]
+    }
+
+    /// Build a mock glyphMaps JSON with spans. For the coverage test, we omit
+    /// span 0x2000 to simulate the real-world failure mode.
+    fn make_glyph_maps_missing_span() -> serde_json::Value {
+        json!({
+            "glyphMaps": [
+                { "page": 0, "spanId": "1000", "byteOffsets": [0, 1] }
+                // Missing page 1 span 0x2000
+            ]
+        })
+    }
+
+    #[test]
+    fn glyph_positions_spans_must_be_covered_by_glyph_maps() {
+        let glyph_positions = make_glyph_positions();
+        let glyph_maps_json = make_glyph_maps_missing_span();
+
+        // Collect span IDs from glyphPositions (hex strings)
+        let mut glyph_positions_spans = std::collections::HashSet::new();
+        for page in &glyph_positions {
+            for span in &page.spans {
+                glyph_positions_spans.insert(format!("{:x}", span.span));
+            }
+        }
+
+        // Collect span IDs from glyphMaps payload (already hex strings)
+        let mut glyph_maps_spans = std::collections::HashSet::new();
+        if let Some(maps) = glyph_maps_json.get("glyphMaps").and_then(|v| v.as_array()) {
+            for m in maps {
+                if let Some(span_id) = m.get("spanId").and_then(|s| s.as_str()) {
+                    glyph_maps_spans.insert(span_id.to_string());
+                }
+            }
+        }
+
+        // The test simulates the failure: glyphPositions has span 0x2000, glyphMaps is missing it.
+        // Assert that we detect the missing coverage.
+        let missing: Vec<_> = glyph_positions_spans
+            .difference(&glyph_maps_spans)
+            .cloned()
+            .collect();
+
+        assert!(
+            !missing.is_empty(),
+            "Expected to find missing spans, but all glyphPositions spans were covered"
+        );
+
+        assert!(
+            missing.contains(&"2000".to_string()),
+            "Span 0x2000 from glyphPositions must be present in glyphMaps"
+        );
+    }
 }
 
 /// Inflate a rectangle by half the stroke thickness in all directions.
@@ -73,10 +175,19 @@ where
     serializer.serialize_str(&format!("{span:x}"))
 }
 
+pub(crate) fn serialize_spans_hex<S>(spans: &[u64], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let strings: Vec<String> = spans.iter().map(|s| format!("{s:x}")).collect();
+    strings.serialize(serializer)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::inflate_rect_by_stroke;
+    use super::{inflate_rect_by_stroke, PageGlyphPositions, SpanGlyphPositions};
     use reflexo::vector::ir::{Point, Rect, Scalar};
+    use serde_json::json;
     use typst::layout::Abs as TypstAbs;
     use typst::visualize::{FixedStroke, LineCap, LineJoin, Paint};
 
@@ -113,6 +224,34 @@ mod tests {
         let inflated = inflate_rect_by_stroke(base, &stroke(0.0));
         assert_eq!(inflated.lo, base.lo);
         assert_eq!(inflated.hi, base.hi);
+    }
+
+    #[test]
+    fn glyph_spans_serialize_to_hex_strings() {
+        let positions = SpanGlyphPositions {
+            span: 0x10,
+            run_index: 0,
+            positions: vec![0.0, 1.0],
+            glyph_spans: vec![0x10, 0x2f],
+            dir_rtl: false,
+            x_min: 0.0,
+            x_max: 1.0,
+            y_min: 0.0,
+            y_max: 1.0,
+        };
+
+        let page = PageGlyphPositions {
+            page: 0,
+            spans: vec![positions],
+        };
+
+        let value = serde_json::to_value(&page).unwrap();
+        assert_eq!(value["spans"][0]["span"], json!("10"));
+        assert_eq!(
+            value["spans"][0]["glyph_spans"],
+            json!(["10", "2f"]),
+            "glyph_spans should serialize as hex strings"
+        );
     }
 }
 

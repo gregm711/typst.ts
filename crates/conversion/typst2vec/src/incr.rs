@@ -84,6 +84,7 @@ impl IncrDocServer {
 
         // run typst2vec pass
         let (pages, layout_map, glyph_map) = self.typst2vec.doc(output);
+
         self.pages = Some(pages.clone());
 
         // let new_items = builder.new_items.get_mut().len();
