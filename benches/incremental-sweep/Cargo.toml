@@ -1,0 +1,26 @@
+[package]
+name = "typst-ts-bench-incremental-sweep"
+description = "Incremental pack_delta sweep across document sizes."
+authors.workspace = true
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+divan = "0.1.3"
+typst.workspace = true
+reflexo-typst2vec = { workspace = true, features = ["incr-glyph-maps"] }
+reflexo-typst = { workspace = true, features = [
+    "flat-vector",
+    "system",
+    "dynamic-layout",
+] }
+typst-ts-cli.workspace = true
+comemo.workspace = true
+
+[[bench]]
+name = "typst-ts-bench-incremental-sweep"
+path = "src/incremental_sweep.rs"
+harness = false

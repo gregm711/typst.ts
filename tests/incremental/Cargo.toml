@@ -26,3 +26,4 @@ typst.workspace = true
 [features]
 generate = []
 pku-thesis = []
+incr-glyph-maps = ["reflexo-typst2vec/incr-glyph-maps"]

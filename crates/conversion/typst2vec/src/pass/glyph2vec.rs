@@ -81,20 +81,42 @@ impl<const ENABLE_REF_CNT: bool> TGlyph2VecPass<ENABLE_REF_CNT> {
         let fonts = fonts.into_iter().map(|(a, _)| a.into_typst()).collect();
 
         let glyphs = self.glyph_defs.clone().into_iter().collect::<Vec<_>>();
-        let glyphs = glyphs
-            .into_par_iter()
-            .flat_map(|(a, b)| {
-                self.inner.must_flat_glyph(&a).map(|g| {
-                    (
-                        GlyphRef {
-                            font_hash: b.1.hash,
-                            glyph_idx: b.0.glyph_idx,
-                        },
-                        g,
-                    )
-                })
-            })
-            .collect();
+        let glyphs = {
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+            {
+                glyphs
+                    .into_iter()
+                    .flat_map(|(a, b)| {
+                        self.inner.must_flat_glyph(&a).map(|g| {
+                            (
+                                GlyphRef {
+                                    font_hash: b.1.hash,
+                                    glyph_idx: b.0.glyph_idx,
+                                },
+                                g,
+                            )
+                        })
+                    })
+                    .collect()
+            }
+            #[cfg(not(all(target_arch = "wasm32", not(feature = "wasm-threads"))))]
+            {
+                glyphs
+                    .into_par_iter()
+                    .flat_map(|(a, b)| {
+                        self.inner.must_flat_glyph(&a).map(|g| {
+                            (
+                                GlyphRef {
+                                    font_hash: b.1.hash,
+                                    glyph_idx: b.0.glyph_idx,
+                                },
+                                g,
+                            )
+                        })
+                    })
+                    .collect()
+            }
+        };
 
         (fonts, glyphs)
     }
@@ -188,13 +210,28 @@ impl IncrGlyph2VecPass {
     pub fn finalize_delta(&self) -> (FontPack, Vec<(GlyphRef, FlatGlyphItem)>) {
         let fonts = std::mem::take(self.new_fonts.lock().deref_mut());
         let glyphs = std::mem::take(self.new_glyphs.lock().deref_mut());
-        let glyphs = glyphs
-            .into_par_iter()
-            .flat_map(|(id, glyph)| {
-                let glyph = self.inner.must_flat_glyph(&glyph);
-                glyph.map(|glyph| (id, glyph))
-            })
-            .collect::<Vec<_>>();
+        let glyphs = {
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+            {
+                glyphs
+                    .into_iter()
+                    .flat_map(|(id, glyph)| {
+                        let glyph = self.inner.must_flat_glyph(&glyph);
+                        glyph.map(|glyph| (id, glyph))
+                    })
+                    .collect::<Vec<_>>()
+            }
+            #[cfg(not(all(target_arch = "wasm32", not(feature = "wasm-threads"))))]
+            {
+                glyphs
+                    .into_par_iter()
+                    .flat_map(|(id, glyph)| {
+                        let glyph = self.inner.must_flat_glyph(&glyph);
+                        glyph.map(|glyph| (id, glyph))
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
         (fonts, glyphs)
     }
 }

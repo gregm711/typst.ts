@@ -230,13 +230,26 @@ impl Default for LazySpanInfo {
 
 impl From<LazySpanCollector> for LazySpanInfo {
     fn from(collector: LazySpanCollector) -> Self {
-        let val = collector
-            .val
-            .into_par_iter()
-            .map(LazyRegionInfo::from)
-            .collect::<Vec<_>>()
-            .try_into()
-            .unwrap();
+        let val = {
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+            {
+                collector
+                    .val
+                    .into_iter()
+                    .map(LazyRegionInfo::from)
+                    .collect::<Vec<_>>()
+            }
+            #[cfg(not(all(target_arch = "wasm32", not(feature = "wasm-threads"))))]
+            {
+                collector
+                    .val
+                    .into_par_iter()
+                    .map(LazyRegionInfo::from)
+                    .collect::<Vec<_>>()
+            }
+        }
+        .try_into()
+        .unwrap();
 
         LazySpanInfo { elem_tree: val }
     }

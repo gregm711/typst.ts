@@ -43,6 +43,7 @@ no-content-hint = []
 glyph2vec = []
 debug-gc = []
 item-dashmap = ["reflexo/item-dashmap"]
+incr-glyph-maps = []
 
 [lints]
 workspace = true

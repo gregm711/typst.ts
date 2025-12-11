@@ -13,6 +13,7 @@ rust-version = "1.88"
 resolver = "2"
 members = [
     "benches/lowering",
+    "benches/incremental-sweep",
 
     "crates/reflexo",
     "crates/reflexo-typst",

@@ -4,6 +4,8 @@ use reflexo::vector::ir::{ModuleMetadata, Page};
 
 use super::ir::FlatModule;
 use super::layout::{PageGlyphPositions, PageLayout};
+#[cfg(feature = "incr-glyph-maps")]
+use super::layout::PageGlyphOffsets;
 use super::pass::IncrTypst2VecPass;
 use crate::debug_loc::{ElementPoint, SourceSpanOffset};
 
@@ -15,6 +17,10 @@ pub struct PackedDelta {
     pub bytes: Vec<u8>,
     pub layout_map: Vec<PageLayout>,
     pub glyph_map: Vec<PageGlyphPositions>,
+    /// Per-glyph local byte offsets captured during traversal.
+    /// Present only when `incr-glyph-maps` is enabled.
+    #[cfg(feature = "incr-glyph-maps")]
+    pub glyph_offsets: Vec<PageGlyphOffsets>,
 }
 
 /// maintains the data of the incremental rendering at server side
@@ -83,6 +89,16 @@ impl IncrDocServer {
         };
 
         // run typst2vec pass
+        #[cfg(feature = "incr-glyph-maps")]
+        let (pages, layout_map, glyph_map, glyph_offsets) = match output {
+            TypstDocument::Html(doc) => {
+                let (pages, layout_map, glyph_map) = self.typst2vec.html(doc);
+                (pages, layout_map, glyph_map, Vec::new())
+            }
+            TypstDocument::Paged(doc) => self.typst2vec.paged_with_glyph_offsets(doc),
+        };
+
+        #[cfg(not(feature = "incr-glyph-maps"))]
         let (pages, layout_map, glyph_map) = self.typst2vec.doc(output);
 
         self.pages = Some(pages.clone());
@@ -135,6 +151,8 @@ impl IncrDocServer {
             bytes: [b"diff-v1,", delta.as_slice()].concat(),
             layout_map,
             glyph_map,
+            #[cfg(feature = "incr-glyph-maps")]
+            glyph_offsets,
         }
     }
 

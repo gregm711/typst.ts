@@ -52,6 +52,29 @@ pub struct PageGlyphPositions {
     pub spans: Vec<SpanGlyphPositions>,
 }
 
+/// Glyph-level local byte offsets for a single text run.
+///
+/// These are the per-glyph `glyph.span.1` offsets captured during typst2vec
+/// traversal. They are NOT absolute byte offsets; the caller must add the
+/// span's Source range start to obtain absolute bytes.
+///
+/// Emitted only when `incr-glyph-maps` feature is enabled.
+#[cfg(feature = "incr-glyph-maps")]
+#[derive(Debug, Clone)]
+pub struct SpanGlyphOffsets {
+    pub span: u64,
+    pub run_index: u32,
+    pub offsets: Vec<u16>,
+}
+
+/// A page worth of glyph local offsets.
+#[cfg(feature = "incr-glyph-maps")]
+#[derive(Debug, Clone)]
+pub struct PageGlyphOffsets {
+    pub page: u32,
+    pub spans: Vec<SpanGlyphOffsets>,
+}
+
 /// Ensure that glyphMaps (byte offsets) cover all spans emitted in glyphPositions
 /// for multi-page documents. This catches cases where generated/derived spans
 /// (e.g., heading numbers) appear in glyphPositions but have no corresponding
