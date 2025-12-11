@@ -668,6 +668,70 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         (pages, layout_map, glyph_map)
     }
 
+    /// Like `paged`, but only processes pages in the filter set.
+    /// This avoids traversing the entire document when only a few pages are needed.
+    pub fn paged_filtered(
+        &self,
+        doc: &TypstPagedDocument,
+        page_filter: &HashSet<u32>,
+    ) -> (Vec<PageLayout>, Vec<PageGlyphPositions>) {
+        let doc_reg = self.spans.start();
+
+        let results: Vec<(PageLayout, PageGlyphPositions)> = doc
+            .pages
+            .par_iter()
+            .enumerate()
+            .filter(|(idx, _)| page_filter.contains(&(*idx as u32)))
+            .map(|(idx, p)| {
+                let page_reg = self.spans.start();
+                let layout = Arc::new(LayoutCollector::default());
+
+                let state = State::new(&doc.introspector, p.frame.size().into_typst());
+                let abs_ref = self.frame_(
+                    state,
+                    &p.frame,
+                    page_reg,
+                    idx,
+                    p.fill_or_transparent(),
+                    None,
+                    Some(layout.clone()),
+                );
+
+                self.spans.push_span(SourceRegion {
+                    region: doc_reg,
+                    idx: idx as u32,
+                    kind: SourceNodeKind::Page { region: page_reg },
+                    item: abs_ref,
+                });
+
+                layout.flush_orphans();
+
+                (
+                    layout.to_page_layout(idx as u32),
+                    layout.to_page_glyph_map(idx as u32),
+                )
+            })
+            .collect();
+
+        let (layout_map, glyph_map): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+
+        // Keep only spans that are present in glyph_map (resolvable spans).
+        let valid_spans: HashSet<u64> = glyph_map
+            .iter()
+            .flat_map(|p| p.spans.iter().map(|s| s.span))
+            .collect();
+
+        let layout_map = layout_map
+            .into_iter()
+            .map(|mut page| {
+                page.spans.retain(|s| valid_spans.contains(&s.span));
+                page
+            })
+            .collect();
+
+        (layout_map, glyph_map)
+    }
+
     fn frame(
         &self,
         state: State,

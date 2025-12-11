@@ -13,6 +13,9 @@ mod test_ieee_template;
 #[cfg(all(test, feature = "incr"))]
 mod test_glyph_maps;
 
+#[cfg(all(test, feature = "incr"))]
+mod test_span_comparison;
+
 pub use crate::builder::TypstFontResolver;
 pub use reflexo_typst::*;
 
@@ -689,6 +692,32 @@ impl TypstCompiler {
         w.incr_compile(state, diagnostics_format)
     }
 
+    /// Extract glyph data (maps + positions) for specific pages from the cached document.
+    /// This is a pure extraction - no incremental delta, no state changes.
+    /// Used for hydration when scrolling to pages not in the initial viewport.
+    ///
+    /// Takes:
+    /// - main_file_path: Path to the main Typst file (for source resolution)
+    /// - state: IncrServer with cached document
+    /// - pages: Array of page indices (0-indexed)
+    ///
+    /// Returns a JS object with:
+    /// - glyphMaps: array of {page, version, spans: [{spanId, byteOffsets}]}
+    /// - glyphPositions: array of {page, spans: [{span, positions, glyph_spans, ...}]}
+    /// - layoutMap: array of {page, spans: [{span, x, y, width, height}]}
+    ///
+    /// Returns null if no document is cached or if pages array is empty.
+    #[cfg(feature = "incr")]
+    pub fn extract_glyph_data(
+        &mut self,
+        main_file_path: String,
+        state: &IncrServer,
+        pages: &JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let w = self.snapshot(None, Some(main_file_path), None)?;
+        w.extract_glyph_data(state, pages)
+    }
+
     #[cfg(feature = "incr")]
     pub fn get_tooltip(&mut self, main_file_path: String, byte_offset: u32) -> Result<JsValue, JsValue> {
         let w = self.snapshot(None, Some(main_file_path), None)?;
@@ -999,10 +1028,6 @@ impl TypstCompileWorld {
             return self.get_diag::<TypstPagedDocument>(diagnostics_format);
         };
 
-        // Collect line boxes before updating state (we need the doc reference)
-        // Line boxes are always collected for all pages (needed for cursor height)
-        let line_boxes = self.collect_line_boxes(&doc);
-
         // Collect glyph maps for accurate click-to-cursor positioning
         // Filter to only requested pages if page_filter is set
         let glyph_maps = self.collect_glyph_maps(&doc, page_filter.as_ref());
@@ -1016,9 +1041,6 @@ impl TypstCompileWorld {
         // Resolve span ranges from the world for source mapping
         let span_ranges = self.resolve_span_ranges(&delta.bytes);
         let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
-
-        // Serialize line boxes for cursor height consistency
-        let line_boxes_js = serde_wasm_bindgen::to_value(&line_boxes).unwrap_or(JsValue::NULL);
 
         // Filter glyph positions by page if filter is active
         let glyph_positions = if let Some(filter) = &page_filter {
@@ -1038,13 +1060,106 @@ impl TypstCompileWorld {
             .flat_map(|page| page.spans.iter().map(|s| s.span_id.clone()))
             .collect();
 
+        // DEBUG: Log span counts before filtering to identify what's being dropped
+        if cfg!(debug_assertions) {
+            let pre_filter_span_count: usize = glyph_positions.iter().map(|p| p.spans.len()).sum();
+            let glyph_positions_span_ids: std::collections::HashSet<String> = glyph_positions
+                .iter()
+                .flat_map(|page| page.spans.iter().map(|s| format!("{:x}", s.span)))
+                .collect();
+
+            // Find spans that are in glyph_positions but NOT in glyph_maps (will be filtered out)
+            let dropped_spans: Vec<&String> = glyph_positions_span_ids
+                .iter()
+                .filter(|id| !span_ids.contains(*id))
+                .collect();
+
+            if !dropped_spans.is_empty() || page_filter.is_some() {
+                console_log(format!(
+                    "[incr_compile] SPAN FILTER DEBUG: glyphMaps has {} unique spans, glyphPositions has {} unique spans, dropping {} spans: {:?}",
+                    span_ids.len(),
+                    glyph_positions_span_ids.len(),
+                    dropped_spans.len(),
+                    dropped_spans.iter().take(10).collect::<Vec<_>>()
+                ));
+            }
+        }
+
+        // ==========================================================================
+        // CARMACK DEBUG ASSERTION: Per-page span parity check BEFORE filtering
+        // This catches divergence between collect_glyph_maps and typst2vec at the source.
+        // ==========================================================================
+        #[cfg(debug_assertions)]
+        {
+            use std::collections::HashSet;
+            let all_pages: HashSet<u32> = glyph_maps.iter().map(|p| p.page)
+                .chain(glyph_positions.iter().map(|p| p.page))
+                .collect();
+
+            for page_num in all_pages {
+                let gm_page = glyph_maps.iter().find(|p| p.page == page_num);
+                let gp_page = glyph_positions.iter().find(|p| p.page == page_num);
+
+                let gm_span_ids: HashSet<String> = gm_page
+                    .map(|p| p.spans.iter().map(|s| s.span_id.to_lowercase()).collect())
+                    .unwrap_or_default();
+                let gp_span_ids: HashSet<String> = gp_page
+                    .map(|p| p.spans.iter().map(|s| format!("{:x}", s.span).to_lowercase()).collect())
+                    .unwrap_or_default();
+
+                let in_gm_not_gp: Vec<_> = gm_span_ids.difference(&gp_span_ids).cloned().collect();
+                let in_gp_not_gm: Vec<_> = gp_span_ids.difference(&gm_span_ids).cloned().collect();
+
+                if !in_gm_not_gp.is_empty() || !in_gp_not_gm.is_empty() {
+                    console_log(format!(
+                        "[SPAN_PARITY_VIOLATION] Page {}: glyphMaps has {} unique spans, glyphPositions has {} unique spans",
+                        page_num, gm_span_ids.len(), gp_span_ids.len()
+                    ));
+                    if !in_gm_not_gp.is_empty() {
+                        console_log(format!(
+                            "[SPAN_PARITY_VIOLATION] Page {}: IN glyphMaps BUT NOT glyphPositions ({} spans): {:?}",
+                            page_num, in_gm_not_gp.len(), in_gm_not_gp.iter().take(10).collect::<Vec<_>>()
+                        ));
+                    }
+                    if !in_gp_not_gm.is_empty() {
+                        console_log(format!(
+                            "[SPAN_PARITY_VIOLATION] Page {}: IN glyphPositions BUT NOT glyphMaps ({} spans): {:?}",
+                            page_num, in_gp_not_gm.len(), in_gp_not_gm.iter().take(10).collect::<Vec<_>>()
+                        ));
+                    }
+                    // In debug builds, panic to surface the issue immediately
+                    // Comment out the panic for now to gather data, uncomment once fix is ready
+                    // panic!(
+                    //     "SPAN_PARITY_VIOLATION: Page {} has {} spans in glyphMaps not in glyphPositions, {} spans in glyphPositions not in glyphMaps",
+                    //     page_num, in_gm_not_gp.len(), in_gp_not_gm.len()
+                    // );
+                }
+            }
+        }
+
         let filtered_glyph_positions = glyph_positions
             .into_iter()
             .map(|mut page| {
+                let before = page.spans.len();
                 page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                let after = page.spans.len();
+                if before != after {
+                    console_log(format!(
+                        "[incr_compile] Page {} filtered: {} -> {} spans ({} dropped)",
+                        page.page, before, after, before - after
+                    ));
+                }
                 page
             })
             .collect::<Vec<_>>();
+
+        let post_filter_span_count: usize = filtered_glyph_positions.iter().map(|p| p.spans.len()).sum();
+        if pre_filter_span_count != post_filter_span_count {
+            console_log(format!(
+                "[incr_compile] TOTAL SPANS FILTERED: {} -> {} ({} dropped)",
+                pre_filter_span_count, post_filter_span_count, pre_filter_span_count - post_filter_span_count
+            ));
+        }
 
         // Serialize glyph maps for accurate click positioning
         let glyph_maps_js = match serde_wasm_bindgen::to_value(&glyph_maps) {
@@ -1103,6 +1218,34 @@ impl TypstCompileWorld {
                 filtered_glyph_positions.len(),
                 filtered_layout_map.len()
             ));
+
+            // CARMACK: Diff span IDs between glyphMaps and glyphPositions BEFORE JS serialization
+            for page_num in filter.iter() {
+                let gm_page = glyph_maps.iter().find(|p| p.page == *page_num);
+                let gp_page = filtered_glyph_positions.iter().find(|p| p.page == *page_num);
+
+                let gm_span_ids: HashSet<String> = gm_page
+                    .map(|p| p.spans.iter().map(|s| s.span_id.clone()).collect())
+                    .unwrap_or_default();
+                let gp_span_ids: HashSet<String> = gp_page
+                    .map(|p| p.spans.iter().map(|s| format!("{:x}", s.span)).collect())
+                    .unwrap_or_default();
+
+                let in_gm_not_gp: Vec<_> = gm_span_ids.difference(&gp_span_ids).collect();
+                let in_gp_not_gm: Vec<_> = gp_span_ids.difference(&gm_span_ids).collect();
+
+                if !in_gm_not_gp.is_empty() || !in_gp_not_gm.is_empty() {
+                    console_log(format!("[SPAN_MISMATCH_RUST] Page {}:", page_num));
+                    if !in_gm_not_gp.is_empty() {
+                        let sample: Vec<_> = in_gm_not_gp.iter().take(5).collect();
+                        console_log(format!("  In glyphMaps but NOT glyphPositions ({}): {:?}", in_gm_not_gp.len(), sample));
+                    }
+                    if !in_gp_not_gm.is_empty() {
+                        let sample: Vec<_> = in_gp_not_gm.iter().take(5).collect();
+                        console_log(format!("  In glyphPositions but NOT glyphMaps ({}): {:?}", in_gp_not_gm.len(), sample));
+                    }
+                }
+            }
         }
 
         Ok(if diagnostics_format != 0 {
@@ -1110,7 +1253,6 @@ impl TypstCompileWorld {
             let result = js_sys::Object::new();
             js_sys::Reflect::set(&result, &"result".into(), &v)?;
             js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
-            js_sys::Reflect::set(&result, &"lineBoxes".into(), &line_boxes_js)?;
             js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
             js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
             js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
@@ -1130,6 +1272,103 @@ impl TypstCompileWorld {
             // For backwards compatibility, just return delta if no diag format
             v
         })
+    }
+
+    /// Extract glyph data (maps + positions) for specific pages from the cached document.
+    /// This is a pure extraction function - no incremental delta, no state changes.
+    /// Used for hydration when scrolling to pages not in the initial viewport.
+    ///
+    /// This decouples cursor data extraction from the incremental render delta,
+    /// allowing hydration to work even when the document hasn't changed.
+    #[cfg(feature = "incr")]
+    pub fn extract_glyph_data(
+        &self,
+        state: &IncrServer,
+        pages: &JsValue,
+    ) -> Result<JsValue, JsValue> {
+        // Parse pages array
+        let pages_array: Vec<u32> = if pages.is_null() || pages.is_undefined() {
+            return Ok(JsValue::NULL);
+        } else {
+            serde_wasm_bindgen::from_value(pages.clone())
+                .map_err(|e| JsValue::from_str(&format!("Invalid pages array: {}", e)))?
+        };
+
+        if pages_array.is_empty() {
+            return Ok(JsValue::NULL);
+        }
+
+        let page_set: HashSet<u32> = pages_array.into_iter().collect();
+
+        // Get cached doc from IncrServer
+        let Some(doc) = state.cached_doc() else {
+            console_log("[extract_glyph_data] No cached document".to_string());
+            return Ok(JsValue::NULL);
+        };
+
+        if cfg!(debug_assertions) {
+            console_log(format!(
+                "[extract_glyph_data] Extracting glyph data for pages {:?} from cached doc with {} pages",
+                page_set, doc.pages.len()
+            ));
+        }
+
+        // Extract glyphMaps (byte offsets) using existing logic
+        let glyph_maps = self.collect_glyph_maps(doc, Some(&page_set));
+
+        // Extract glyphPositions (X/Y coordinates) using IncrServer's new method
+        let Some((layout_map, glyph_positions)) = state.extract_glyph_positions_for_pages(&page_set) else {
+            console_log("[extract_glyph_data] Failed to extract glyph positions".to_string());
+            return Ok(JsValue::NULL);
+        };
+
+        // Filter glyphPositions to only include spans that have byte offsets in glyphMaps.
+        // This ensures parity and prevents orphan spans (generated content without source mapping).
+        let span_ids: std::collections::HashSet<String> = glyph_maps
+            .iter()
+            .flat_map(|page| page.spans.iter().map(|s| s.span_id.clone()))
+            .collect();
+
+        let filtered_glyph_positions: Vec<_> = glyph_positions
+            .into_iter()
+            .map(|mut page| {
+                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page
+            })
+            .collect();
+
+        // Similarly filter layoutMap to keep coherence
+        let filtered_layout_map: Vec<_> = layout_map
+            .into_iter()
+            .map(|mut page| {
+                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page
+            })
+            .collect();
+
+        if cfg!(debug_assertions) {
+            console_log(format!(
+                "[extract_glyph_data] Extracted {} glyphMaps pages, {} glyphPositions pages (filtered), {} layoutMap pages (filtered)",
+                glyph_maps.len(), filtered_glyph_positions.len(), filtered_layout_map.len()
+            ));
+        }
+
+        // Serialize to JS
+        let result = js_sys::Object::new();
+
+        let glyph_maps_js = serde_wasm_bindgen::to_value(&glyph_maps)
+            .map_err(|e| JsValue::from_str(&format!("Failed to serialize glyphMaps: {}", e)))?;
+        js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
+
+        let glyph_positions_js = serde_wasm_bindgen::to_value(&filtered_glyph_positions)
+            .map_err(|e| JsValue::from_str(&format!("Failed to serialize glyphPositions: {}", e)))?;
+        js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
+
+        let layout_map_js = serde_wasm_bindgen::to_value(&filtered_layout_map)
+            .map_err(|e| JsValue::from_str(&format!("Failed to serialize layoutMap: {}", e)))?;
+        js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
+
+        Ok(result.into())
     }
 
     /// Resolve span IDs from delta to byte ranges using the world.
@@ -1495,10 +1734,27 @@ impl TypstCompileWorld {
             Self::collect_glyphs_from_frame(&page.frame, &source, &mut spans);
 
             if !spans.is_empty() {
+                // BUGFIX: Merge duplicate span entries into single entries per unique span_id.
+                // This matches typst2vec.rs behavior where each span has one entry per run,
+                // but we were creating multiple entries when spans appeared in multiple
+                // FrameItem::Text elements (e.g., heading marker + heading text).
+                //
+                // Group by span_id and concatenate byte_offsets for each occurrence.
+                use std::collections::HashMap;
+                let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
+                for span in spans {
+                    merged.entry(span.span_id)
+                        .or_default()
+                        .extend(span.byte_offsets);
+                }
+                let merged_spans: Vec<SpanGlyphMap> = merged.into_iter()
+                    .map(|(span_id, byte_offsets)| SpanGlyphMap { span_id, byte_offsets })
+                    .collect();
+
                 page_maps.push(PageGlyphMap {
                     page: page_idx as u32,
                     version: 1, // Increment on each compile if caching
-                    spans,
+                    spans: merged_spans,
                 });
             }
         }
@@ -1551,108 +1807,112 @@ impl TypstCompileWorld {
                     Self::collect_glyphs_from_frame(&group.frame, source, result);
                 }
                 FrameItem::Text(text) => {
-                    // Find an "anchor" glyph - first attached (non-detached) glyph with resolvable span
-                    // Used ONLY for detached glyphs - attached glyphs keep their own span ID
-                    let anchor: Option<(u64, std::ops::Range<usize>)> = text.glyphs.iter()
-                        .find_map(|g| {
-                            let span = g.span.0;
-                            if !span.is_detached() {
-                                source.range(span).map(|range| (span.into_raw().get(), range))
-                            } else {
-                                None
-                            }
+                    // Find an "anchor" glyph - first attached (non-detached) glyph in this text item.
+                    // Used to give synthetic (detached) glyphs a valid span ID.
+                    //
+                    // MATCH TYPST2VEC EXACTLY: typst2vec uses unwrap_or(0) and then skips id==0.
+                    // We do the same - always get anchor_id, and use 0 for purely synthetic items.
+                    let anchor_id: u64 = text.glyphs.iter()
+                        .find(|g| !g.span.0.is_detached())
+                        .map(|g| g.span.0.into_raw().get())
+                        .unwrap_or(0);
+
+                    // Skip purely synthetic text items (no anchor) - matches typst2vec's `if id != 0`
+                    if anchor_id == 0 {
+                        // Buffer for later assignment (existing behavior)
+                        let mut byte_offsets: Vec<usize> = Vec::with_capacity(text.glyphs.len() + 1);
+                        for _ in 0..=text.glyphs.len() {
+                            byte_offsets.push(0);
+                        }
+                        synthetic_buffer.push(byte_offsets);
+                        continue;
+                    }
+
+                    // Get anchor range for fallback byte offsets. If not resolvable, use 0..0,
+                    // but still emit offsets (matching typst2vec behavior: id != 0 is sufficient).
+                    let anchor_range = text.glyphs.iter()
+                        .find(|g| !g.span.0.is_detached())
+                        .and_then(|g| source.range(g.span.0))
+                        .unwrap_or(0..0);
+
+                    let anchor_span_id = format!("{:x}", anchor_id);
+
+                    // FLUSH: Assign buffered synthetic items to the anchor span
+                    for buffered_offsets in synthetic_buffer.drain(..) {
+                        result.push(SpanGlyphMap {
+                            span_id: anchor_span_id.clone(),
+                            byte_offsets: buffered_offsets,
                         });
+                    }
 
-                    if let Some((anchor_raw, anchor_range)) = anchor {
-                        // This text item has a valid anchor
-                        let anchor_span_id = format!("{:x}", anchor_raw);
+                    // Process this text item's glyphs - GROUP BY SPAN ID
+                    // This matches typst2vec.rs behavior where each glyph uses its own span
+                    // (or anchor for detached glyphs)
+                    use std::collections::HashMap;
+                    let mut per_span_offsets: HashMap<u64, Vec<usize>> = HashMap::new();
+                    let mut last_resolved_byte: Option<usize> = None;
+                    let mut last_span_id: Option<u64> = None;
 
-                        // FLUSH: Assign buffered synthetic items to the anchor span
-                        for buffered_offsets in synthetic_buffer.drain(..) {
-                            result.push(SpanGlyphMap {
-                                span_id: anchor_span_id.clone(),
-                                byte_offsets: buffered_offsets,
-                            });
-                        }
+                    for glyph in text.glyphs.iter() {
+                        let glyph_span = glyph.span.0;
+                        let local_offset = glyph.span.1 as usize;
 
-                        // Process this text item's glyphs - GROUP BY SPAN ID
-                        // This matches typst2vec.rs behavior where each glyph uses its own span
-                        // (or anchor for detached glyphs)
-                        use std::collections::HashMap;
-                        let mut per_span_offsets: HashMap<u64, Vec<usize>> = HashMap::new();
-                        let mut last_resolved_byte: Option<usize> = None;
-                        let mut last_span_id: Option<u64> = None;
+                        // Determine span ID - matches typst2vec.rs logic exactly
+                        let span_id = if glyph_span.is_detached() {
+                            anchor_id  // Use anchor for detached
+                        } else {
+                            glyph_span.into_raw().get()  // Use own span for attached
+                        };
 
-                        for glyph in text.glyphs.iter() {
-                            let glyph_span = glyph.span.0;
-                            let local_offset = glyph.span.1 as usize;
-
-                            // Determine span ID - matches typst2vec.rs logic exactly
-                            let span_id = if glyph_span.is_detached() {
-                                anchor_raw  // Use anchor for detached
+                        // Prefer glyph's own range; fall back to anchor start; if still none,
+                        // use last_resolved_byte+1 or 0. Do not skip the glyph.
+                        let byte_pos = if !glyph_span.is_detached() {
+                            if let Some(range) = source.range(glyph_span) {
+                                let pos = range.start + local_offset;
+                                last_resolved_byte = Some(pos);
+                                pos
                             } else {
-                                glyph_span.into_raw().get()  // Use own span for attached
-                            };
-
-                            let byte_pos = if !glyph_span.is_detached() {
-                                if let Some(range) = source.range(glyph_span) {
-                                    let pos = range.start + local_offset;
-                                    last_resolved_byte = Some(pos);
-                                    pos
-                                } else {
-                                    anchor_range.start
-                                }
-                            } else {
-                                // Detached glyph within mixed item: use anchor byte
                                 anchor_range.start
-                            };
+                            }
+                        } else {
+                            anchor_range.start
+                        };
 
-                            per_span_offsets.entry(span_id).or_default().push(byte_pos);
-                            last_span_id = Some(span_id);
-                        }
+                        per_span_offsets.entry(span_id).or_default().push(byte_pos);
+                        last_span_id = Some(span_id);
+                    }
 
-                        // Add end position to the last span
-                        if let (Some(last_glyph), Some(last_id)) = (text.glyphs.last(), last_span_id) {
-                            let last_span = last_glyph.span.0;
-                            let last_local_offset = last_glyph.span.1 as usize;
+                    // Add end position to the last span
+                    if let (Some(last_glyph), Some(last_id)) = (text.glyphs.last(), last_span_id) {
+                        let last_span = last_glyph.span.0;
+                        let last_local_offset = last_glyph.span.1 as usize;
 
-                            let end_byte = if !last_span.is_detached() {
-                                if let Some(range) = source.range(last_span) {
-                                    range.start + last_local_offset + 1
-                                } else {
-                                    last_resolved_byte.map(|b| b + 1).unwrap_or(anchor_range.start + 1)
-                                }
+                        let end_byte = if !last_span.is_detached() {
+                            if let Some(range) = source.range(last_span) {
+                                range.start + last_local_offset + 1
                             } else {
                                 last_resolved_byte.map(|b| b + 1).unwrap_or(anchor_range.start + 1)
-                            };
-
-                            per_span_offsets.entry(last_id).or_default().push(end_byte);
-                        }
-
-                        // Emit one SpanGlyphMap per span
-                        for (span_raw, byte_offsets) in per_span_offsets {
-                            if !byte_offsets.is_empty() {
-                                let span_id = format!("{:x}", span_raw);
-                                result.push(SpanGlyphMap {
-                                    span_id,
-                                    byte_offsets,
-                                });
                             }
-                        }
+                        } else {
+                            last_resolved_byte.map(|b| b + 1).unwrap_or(anchor_range.start + 1)
+                        };
 
-                        // Update last_valid_span for end-of-frame fallback
-                        last_valid_span = Some((anchor_span_id, anchor_range.start));
-                    } else {
-                        // Purely synthetic text item - BUFFER it
-                        // Create placeholder byte offsets (all pointing to 0, will be reassigned)
-                        let mut byte_offsets: Vec<usize> = Vec::with_capacity(text.glyphs.len() + 1);
-                        for _ in 0..text.glyphs.len() {
-                            byte_offsets.push(0); // Placeholder
-                        }
-                        byte_offsets.push(0); // End position placeholder
-
-                        synthetic_buffer.push(byte_offsets);
+                        per_span_offsets.entry(last_id).or_default().push(end_byte);
                     }
+
+                    // Emit one SpanGlyphMap per span
+                    for (span_raw, byte_offsets) in per_span_offsets {
+                        if !byte_offsets.is_empty() {
+                            let span_id = format!("{:x}", span_raw);
+                            result.push(SpanGlyphMap {
+                                span_id,
+                                byte_offsets,
+                            });
+                        }
+                    }
+
+                    // Update last_valid_span for end-of-frame fallback
+                    last_valid_span = Some((anchor_span_id, anchor_range.start));
                 }
                 _ => {}
             }

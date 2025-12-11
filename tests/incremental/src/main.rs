@@ -586,6 +586,148 @@ Hello world!
         );
     }
 
+    /// CRITICAL TEST: Verify span count alignment between typst2vec (delta.glyph_map)
+    /// and what the main-thread glyph map collector would produce.
+    ///
+    /// BUG REPRODUCTION: During hydration of pages 2+, the console shows:
+    ///   glyphPositions=[{"page":1,"spanCount":21}]
+    ///   glyphMaps=[{"page":1,"spanCount":24}]
+    ///
+    /// This 3-span mismatch causes heading clicks to fail because:
+    /// - glyphMaps (from collect_glyph_maps in lib.rs) has the heading spans
+    /// - glyphPositions (from delta.glyph_map via typst2vec) is missing them
+    /// - The filtering in incr_compile keeps only spans in BOTH
+    /// - Result: headings have byte offsets but no X/Y positions
+    ///
+    /// Root cause: typst2vec.rs and lib.rs traverse the frame differently,
+    /// or one filters out certain spans that the other includes.
+    #[test]
+    fn glyph_map_span_count_matches_glyph_positions_span_count() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+        server.set_should_attach_debug_info(true);
+
+        // Multi-page document with headings (the bug case)
+        let source = r#"
+#set page(width: 400pt, height: 300pt, margin: 20pt)
+
+= Chapter 1: Introduction
+
+This is the first paragraph. It contains regular text.
+
+== Section 1.1
+
+More content here with some text to fill the page.
+
+#pagebreak()
+
+= Chapter 2: Methods
+
+This is page 2 of the document with a chapter heading.
+
+== Section 2.1
+
+Additional content for the second page.
+"#;
+
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        let page_count = doc.pages.len();
+        assert!(page_count >= 2, "test document should have at least 2 pages");
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc));
+
+        // delta.glyph_map comes from typst2vec (the "glyphPositions" in JS)
+        let glyph_positions = &delta.glyph_map;
+
+        // delta.layout_map also comes from typst2vec
+        let layout_map = &delta.layout_map;
+
+        eprintln!("\n=== Span Count Analysis ===");
+        for page_gp in glyph_positions {
+            let gp_span_count = page_gp.spans.len();
+            eprintln!("Page {}: glyphPositions has {} spans", page_gp.page, gp_span_count);
+
+            // Find corresponding layout map page
+            if let Some(page_lm) = layout_map.iter().find(|lm| lm.page == page_gp.page) {
+                let lm_span_count = page_lm.spans.len();
+                eprintln!("Page {}: layoutMap has {} spans", page_lm.page, lm_span_count);
+            }
+        }
+
+        // Collect unique span IDs from glyphPositions
+        let gp_span_ids: std::collections::HashSet<u64> = glyph_positions
+            .iter()
+            .flat_map(|page| page.spans.iter().map(|s| s.span))
+            .collect();
+
+        // Collect unique span IDs from layoutMap
+        let lm_span_ids: std::collections::HashSet<u64> = layout_map
+            .iter()
+            .flat_map(|page| page.spans.iter().map(|s| s.span))
+            .collect();
+
+        eprintln!("\nTotal unique spans:");
+        eprintln!("  glyphPositions: {} spans", gp_span_ids.len());
+        eprintln!("  layoutMap: {} spans", lm_span_ids.len());
+
+        // Find spans in layoutMap but not in glyphPositions (potential headings)
+        let missing_from_gp: Vec<_> = lm_span_ids.difference(&gp_span_ids).collect();
+        if !missing_from_gp.is_empty() {
+            eprintln!("\n!! MISSING from glyphPositions (but in layoutMap): {:?}", missing_from_gp);
+        }
+
+        // Find spans in glyphPositions but not in layoutMap
+        let missing_from_lm: Vec<_> = gp_span_ids.difference(&lm_span_ids).collect();
+        if !missing_from_lm.is_empty() {
+            eprintln!("!! MISSING from layoutMap (but in glyphPositions): {:?}", missing_from_lm);
+        }
+
+        // KEY ASSERTION: glyphPositions and layoutMap should have the same span coverage
+        // If this fails, it indicates the bug where one code path misses spans
+        assert!(
+            missing_from_gp.is_empty(),
+            "SPAN MISMATCH BUG: {} spans in layoutMap missing from glyphPositions. \
+             These spans will have bounding boxes but no glyph positions, \
+             causing clicks to fail. Missing: {:?}",
+            missing_from_gp.len(),
+            missing_from_gp
+        );
+
+        // Each page should have consistent span counts between the two sources
+        for page_gp in glyph_positions {
+            if let Some(page_lm) = layout_map.iter().find(|lm| lm.page == page_gp.page) {
+                let gp_spans: std::collections::HashSet<_> =
+                    page_gp.spans.iter().map(|s| s.span).collect();
+                let lm_spans: std::collections::HashSet<_> =
+                    page_lm.spans.iter().map(|s| s.span).collect();
+
+                // Find per-page differences
+                let page_missing: Vec<_> = lm_spans.difference(&gp_spans).collect();
+                if !page_missing.is_empty() {
+                    eprintln!(
+                        "Page {}: {} spans in layoutMap missing from glyphPositions: {:?}",
+                        page_gp.page, page_missing.len(), page_missing
+                    );
+                }
+
+                assert!(
+                    page_missing.is_empty(),
+                    "Page {}: layoutMap has {} spans not in glyphPositions. \
+                     This causes click failures on these elements.",
+                    page_gp.page,
+                    page_missing.len()
+                );
+            }
+        }
+
+        eprintln!("\n=== PASS: Span counts match ===\n");
+    }
+
     /// Test that plain text following bold/emphasized text in list items gets glyph positions.
     ///
     /// The bug: glyphMaps correctly assigns byte offsets, but glyphPositions uses
@@ -647,6 +789,264 @@ Hello world!
             "expected at least 35 total glyphs, got {}. Plain text may be missing.",
             total_glyphs
         );
+    }
+
+    /// CARMACK PARITY TEST: Compare span IDs from lib.rs-style traversal vs typst2vec.
+    ///
+    /// This test mimics `collect_glyph_maps` traversal logic and compares the resulting
+    /// span IDs with what typst2vec produces in `delta.glyph_map`.
+    ///
+    /// If this test fails, it means the two code paths diverge, which causes:
+    /// - Spans to be filtered out in `incr_compile`
+    /// - Clicks to fail on hydrated pages
+    #[test]
+    fn span_parity_lib_rs_vs_typst2vec() {
+        use typst::layout::FrameItem;
+
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+        server.set_should_attach_debug_info(true);
+
+        // Multi-page document with headings and paragraphs
+        let source = r#"
+#set page(width: 400pt, height: 300pt, margin: 20pt)
+
+= Chapter 1: Introduction
+
+This is the first paragraph. It contains regular text that should be clickable.
+
+== Section 1.1
+
+More content here with some text to fill the page.
+
+#pagebreak()
+
+= Chapter 2: Methods
+
+This is page 2 of the document with a chapter heading.
+
+== Section 2.1
+
+Additional content for the second page.
+"#;
+
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        // Get typst2vec's span IDs
+        let delta = server.pack_delta(&TypstDocument::Paged(doc.clone()));
+        let typst2vec_span_ids: HashSet<u64> = delta.glyph_map
+            .iter()
+            .flat_map(|page| page.spans.iter().map(|s| s.span))
+            .collect();
+
+        // Extract span IDs the way lib.rs collect_glyph_maps does:
+        // Traverse frames, find FrameItem::Text, extract span IDs from glyphs
+        fn collect_spans_from_frame(frame: &typst::layout::Frame, result: &mut HashSet<u64>) {
+            for (_pos, item) in frame.items() {
+                match item {
+                    FrameItem::Group(group) => {
+                        collect_spans_from_frame(&group.frame, result);
+                    }
+                    FrameItem::Text(text) => {
+                        // Find anchor span (first non-detached glyph)
+                        let anchor_id: u64 = text.glyphs.iter()
+                            .find(|g| !g.span.0.is_detached())
+                            .map(|g| g.span.0.into_raw().get())
+                            .unwrap_or(0);
+
+                        // Skip purely synthetic items (matches lib.rs behavior)
+                        if anchor_id == 0 {
+                            continue;
+                        }
+
+                        // Collect span IDs from all glyphs (using anchor for detached)
+                        for glyph in text.glyphs.iter() {
+                            let span_id = if glyph.span.0.is_detached() {
+                                anchor_id
+                            } else {
+                                glyph.span.0.into_raw().get()
+                            };
+                            if span_id != 0 {
+                                result.insert(span_id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut lib_rs_span_ids: HashSet<u64> = HashSet::new();
+        for page in &doc.pages {
+            collect_spans_from_frame(&page.frame, &mut lib_rs_span_ids);
+        }
+
+        eprintln!("\n=== SPAN PARITY TEST ===");
+        eprintln!("lib.rs-style traversal: {} unique spans", lib_rs_span_ids.len());
+        eprintln!("typst2vec glyph_map: {} unique spans", typst2vec_span_ids.len());
+
+        // Find divergences
+        let in_lib_not_typst2vec: Vec<_> = lib_rs_span_ids.difference(&typst2vec_span_ids)
+            .map(|id| format!("{:x}", id))
+            .collect();
+        let in_typst2vec_not_lib: Vec<_> = typst2vec_span_ids.difference(&lib_rs_span_ids)
+            .map(|id| format!("{:x}", id))
+            .collect();
+
+        if !in_lib_not_typst2vec.is_empty() {
+            eprintln!("\n!! IN lib.rs BUT NOT typst2vec ({} spans):", in_lib_not_typst2vec.len());
+            for (i, span_id) in in_lib_not_typst2vec.iter().take(10).enumerate() {
+                eprintln!("  {}. {}", i + 1, span_id);
+            }
+        }
+
+        if !in_typst2vec_not_lib.is_empty() {
+            eprintln!("\n!! IN typst2vec BUT NOT lib.rs ({} spans):", in_typst2vec_not_lib.len());
+            for (i, span_id) in in_typst2vec_not_lib.iter().take(10).enumerate() {
+                eprintln!("  {}. {}", i + 1, span_id);
+            }
+        }
+
+        // PARITY ASSERTION: Both should produce the same spans
+        assert!(
+            in_lib_not_typst2vec.is_empty() && in_typst2vec_not_lib.is_empty(),
+            "SPAN PARITY VIOLATION:\n\
+             - {} spans in lib.rs but NOT typst2vec: {:?}\n\
+             - {} spans in typst2vec but NOT lib.rs: {:?}\n\
+             This divergence causes click failures on hydrated pages.",
+            in_lib_not_typst2vec.len(), in_lib_not_typst2vec.iter().take(5).collect::<Vec<_>>(),
+            in_typst2vec_not_lib.len(), in_typst2vec_not_lib.iter().take(5).collect::<Vec<_>>()
+        );
+
+        eprintln!("\n=== SPAN PARITY PASS ===\n");
+    }
+
+    /// Test per-page span parity to catch divergence in page-filtered scenarios (hydration).
+    ///
+    /// The bug manifests when:
+    /// - Full compile: page 0 cached
+    /// - Scroll to page 2: page 2 compiled with filter
+    /// - Span counts differ between cached page 0 data and newly compiled page 2 data
+    #[test]
+    fn per_page_span_parity() {
+        use typst::layout::FrameItem;
+
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+        server.set_should_attach_debug_info(true);
+
+        // Multi-page document
+        let source = r#"
+#set page(width: 400pt, height: 300pt, margin: 20pt)
+
+= Page 0 Heading
+
+Paragraph on page zero with some content.
+
+#pagebreak()
+
+= Page 1 Heading
+
+Another paragraph on page one.
+
+#pagebreak()
+
+= Page 2 Heading
+
+Third paragraph on page two.
+"#;
+
+        let doc = driver
+            .snapshot_with_entry_content(Bytes::from_string(source.to_owned()), None)
+            .compile()
+            .output
+            .expect("compile document");
+
+        assert!(doc.pages.len() >= 3, "Need at least 3 pages");
+
+        // Get typst2vec's span IDs per page
+        let delta = server.pack_delta(&TypstDocument::Paged(doc.clone()));
+
+        // Helper to collect spans from a single frame
+        fn collect_spans_from_frame(frame: &typst::layout::Frame, result: &mut HashSet<u64>) {
+            for (_pos, item) in frame.items() {
+                match item {
+                    FrameItem::Group(group) => {
+                        collect_spans_from_frame(&group.frame, result);
+                    }
+                    FrameItem::Text(text) => {
+                        let anchor_id: u64 = text.glyphs.iter()
+                            .find(|g| !g.span.0.is_detached())
+                            .map(|g| g.span.0.into_raw().get())
+                            .unwrap_or(0);
+
+                        if anchor_id == 0 {
+                            continue;
+                        }
+
+                        for glyph in text.glyphs.iter() {
+                            let span_id = if glyph.span.0.is_detached() {
+                                anchor_id
+                            } else {
+                                glyph.span.0.into_raw().get()
+                            };
+                            if span_id != 0 {
+                                result.insert(span_id);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        eprintln!("\n=== PER-PAGE SPAN PARITY TEST ===");
+
+        for (page_idx, page) in doc.pages.iter().enumerate() {
+            // lib.rs-style spans for this page
+            let mut lib_rs_spans: HashSet<u64> = HashSet::new();
+            collect_spans_from_frame(&page.frame, &mut lib_rs_spans);
+
+            // typst2vec spans for this page
+            let typst2vec_page = delta.glyph_map.iter().find(|p| p.page == page_idx as u32);
+            let typst2vec_spans: HashSet<u64> = typst2vec_page
+                .map(|p| p.spans.iter().map(|s| s.span).collect())
+                .unwrap_or_default();
+
+            let in_lib_not_t2v: Vec<_> = lib_rs_spans.difference(&typst2vec_spans)
+                .map(|id| format!("{:x}", id))
+                .collect();
+            let in_t2v_not_lib: Vec<_> = typst2vec_spans.difference(&lib_rs_spans)
+                .map(|id| format!("{:x}", id))
+                .collect();
+
+            eprintln!(
+                "Page {}: lib.rs={} spans, typst2vec={} spans, diff=[+{}, -{}]",
+                page_idx,
+                lib_rs_spans.len(),
+                typst2vec_spans.len(),
+                in_lib_not_t2v.len(),
+                in_t2v_not_lib.len()
+            );
+
+            if !in_lib_not_t2v.is_empty() {
+                eprintln!("  IN lib.rs NOT typst2vec: {:?}", in_lib_not_t2v.iter().take(5).collect::<Vec<_>>());
+            }
+            if !in_t2v_not_lib.is_empty() {
+                eprintln!("  IN typst2vec NOT lib.rs: {:?}", in_t2v_not_lib.iter().take(5).collect::<Vec<_>>());
+            }
+
+            assert!(
+                in_lib_not_t2v.is_empty() && in_t2v_not_lib.is_empty(),
+                "Page {} span parity violation", page_idx
+            );
+        }
+
+        eprintln!("\n=== PER-PAGE SPAN PARITY PASS ===\n");
     }
 
 }
