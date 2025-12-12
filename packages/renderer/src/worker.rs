@@ -92,7 +92,9 @@ impl TypstWorker {
             return Err(error_once!("Renderer.InvalidActionDataLength"));
         }
 
-        web_sys::console::log_1(&format!("render_canvas {data:?}").into());
+        if cfg!(debug_assertions) {
+            web_sys::console::log_1(&format!("render_canvas {data:?}").into());
+        }
 
         let mut promises = Vec::new();
         let inp = actions.into_iter().zip(canvas_list).zip(data);
@@ -169,12 +171,16 @@ pub(crate) fn create_worker(js: JsWorker) -> Arc<WorkerCore> {
     this._handler.get_or_init(|| {
         let handler = Closure::wrap(Box::new(move |event: JsValue| {
             let Some(that) = that.upgrade() else {
-                web_sys::console::log_1(&"worker dropped when handling code".into());
+                if cfg!(debug_assertions) {
+                    web_sys::console::log_1(&"worker dropped when handling code".into());
+                }
                 return;
             };
 
             // { exception: 'loadSvg', idx, blob }
-            web_sys::console::log_1(&event);
+            if cfg!(debug_assertions) {
+                web_sys::console::log_1(&event);
+            }
             let data = js_sys::Reflect::get(&event, &JsValue::from_str("data")).unwrap();
             let resp = data.dyn_into::<js_sys::Array>();
 
@@ -230,11 +236,15 @@ pub(crate) fn create_worker(js: JsWorker) -> Arc<WorkerCore> {
                             return;
                         }
 
-                        web_sys::console::log_2(&"invalid exception found".into(), &event);
+                        if cfg!(debug_assertions) {
+                            web_sys::console::log_2(&"invalid exception found".into(), &event);
+                        }
                         return;
                     }
 
-                    web_sys::console::log_2(&"invalid response found".into(), &event);
+                    if cfg!(debug_assertions) {
+                        web_sys::console::log_2(&"invalid response found".into(), &event);
+                    }
                     return;
                 }
             };
@@ -244,7 +254,9 @@ pub(crate) fn create_worker(js: JsWorker) -> Arc<WorkerCore> {
 
             let mut requests = that.requests.lock().unwrap();
             let Some(resolve) = requests.remove(&idx) else {
-                web_sys::console::log_1(&format!("no request found for {idx}").into());
+                if cfg!(debug_assertions) {
+                    web_sys::console::log_1(&format!("no request found for {idx}").into());
+                }
                 return;
             };
             drop(requests);
@@ -302,7 +314,9 @@ impl WorkerCore {
         } else {
             transfers
         };
-        web_sys::console::log_2(&"send_with".into(), &transfers);
+        if cfg!(debug_assertions) {
+            web_sys::console::log_2(&"send_with".into(), &transfers);
+        }
         let transfers = if transfers == JsValue::UNDEFINED {
             js_sys::Array::from_iter([buf])
         } else {
@@ -473,7 +487,9 @@ impl WorkerBridge {
 
             (x, y)
         });
-        web_sys::console::log_1(&format!("msg: {x:?}").into());
+        if cfg!(debug_assertions) {
+            web_sys::console::log_1(&format!("msg: {x:?}").into());
+        }
         let Msg { request: x, id } = x;
 
         let previous_promise = self.previous_promise.take();
@@ -497,7 +513,9 @@ impl WorkerBridge {
                         _ => Err(error_once!("Renderer.UnsupportedAction", action: action)),
                     };
                     if let Err(e) = res {
-                        web_sys::console::log_1(&format!("manipulate error: {e}").into());
+                        if cfg!(debug_assertions) {
+                            web_sys::console::log_1(&format!("manipulate error: {e}").into());
+                        }
                     }
                     Ok(JsValue::NULL)
                 });
@@ -530,13 +548,23 @@ impl WorkerBridge {
                 let previous_promise = previous_promise.clone();
                 let p = wasm_bindgen_futures::future_to_promise(async move {
                     if let Some(p) = previous_promise {
-                        web_sys::console::log_1(&"wait for previous promise 2".into());
+                        if cfg!(debug_assertions) {
+                            web_sys::console::log_1(&"wait for previous promise 2".into());
+                        }
                         let _ = wasm_bindgen_futures::JsFuture::from(p).await;
-                        web_sys::console::log_1(&"wait for previous promise 2 end".into());
+                        if cfg!(debug_assertions) {
+                            web_sys::console::log_1(&"wait for previous promise 2 end".into());
+                        }
                     }
-                    web_sys::console::log_1(&format!("render_page_to_canvas lock {magic}").into());
+                    if cfg!(debug_assertions) {
+                        web_sys::console::log_1(
+                            &format!("render_page_to_canvas lock {magic}").into(),
+                        );
+                    }
                     let ses = session.lock().unwrap();
-                    web_sys::console::log_1(&"render_page_to_canvas lock 2".into());
+                    if cfg!(debug_assertions) {
+                        web_sys::console::log_1(&"render_page_to_canvas lock 2".into());
+                    }
                     let (fg, content, res) = plugin
                         .render_page_to_canvas_internal::<DefaultExportFeature>(
                             &ses,
@@ -546,18 +574,22 @@ impl WorkerBridge {
                         .await
                         .unwrap();
                     drop(ses);
-                    web_sys::console::log_1(&"render_page_to_canvas lock end".into());
+                    if cfg!(debug_assertions) {
+                        web_sys::console::log_1(&"render_page_to_canvas lock end".into());
+                    }
                     let content = if content == JsValue::UNDEFINED {
                         JsValue::NULL
                     } else {
                         content
                     };
                     let t = js_sys::JSON::stringify(&content).unwrap();
-                    web_sys::console::log_3(
-                        &"js_sys::JSON::stringify".into(),
-                        &content,
-                        &(&t).into(),
-                    );
+                    if cfg!(debug_assertions) {
+                        web_sys::console::log_3(
+                            &"js_sys::JSON::stringify".into(),
+                            &content,
+                            &(&t).into(),
+                        );
+                    }
                     let content: String = t.into();
                     let p = (fg, content, res);
                     let b = to_bytes(&p);
@@ -602,9 +634,13 @@ impl WorkerBridge {
 
         let p = wasm_bindgen_futures::future_to_promise(async move {
             if let Some(p) = previous_promise {
-                web_sys::console::log_1(&"wait for previous promise".into());
+                if cfg!(debug_assertions) {
+                    web_sys::console::log_1(&"wait for previous promise".into());
+                }
                 let _ = wasm_bindgen_futures::JsFuture::from(p).await;
-                web_sys::console::log_1(&"wait for previous promise end".into());
+                if cfg!(debug_assertions) {
+                    web_sys::console::log_1(&"wait for previous promise end".into());
+                }
             }
 
             let res = res;
@@ -621,7 +657,9 @@ impl WorkerBridge {
                 .dyn_into::<web_sys::DedicatedWorkerGlobalScope>()
                 .unwrap();
             ws.post_message(&resp).unwrap();
-            web_sys::console::log_1(&"post_message end".into());
+            if cfg!(debug_assertions) {
+                web_sys::console::log_1(&"post_message end".into());
+            }
             Ok(JsValue::NULL)
         });
         self.previous_promise = Some(p.clone());
@@ -639,12 +677,16 @@ pub struct RemoteRenderSession {
 
 impl Drop for RemoteRenderSession {
     fn drop(&mut self) {
-        web_sys::console::log_1(&"dropped RemoteRenderSession".into());
+        if cfg!(debug_assertions) {
+            web_sys::console::log_1(&"dropped RemoteRenderSession".into());
+        }
         let this = Arc::clone(&self.worker);
         let session_info = self.session_info;
         wasm_bindgen_futures::spawn_local(async move {
             let res = this.request(Request::RemoveSession(session_info)).await;
-            web_sys::console::log_2(&"remove session result:".into(), &res);
+            if cfg!(debug_assertions) {
+                web_sys::console::log_2(&"remove session result:".into(), &res);
+            }
         });
     }
 }

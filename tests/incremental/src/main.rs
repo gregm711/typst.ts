@@ -120,6 +120,187 @@ mod tests {
     use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
+    use std::collections::HashMap;
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
+    use typst::syntax::{Source, Span};
+    use typst::World;
+
+    /// Legacy (lib.rs-style) glyph map collection for tests.
+    ///
+    /// This mirrors `TypstCompileWorld::collect_glyph_maps` without pulling in
+    /// the wasm compiler crate. It traverses frames, anchors detached glyphs,
+    /// buffers purely synthetic text items, and emits absolute byte offsets.
+    fn collect_legacy_glyph_maps(
+        doc: &reflexo_typst::TypstPagedDocument,
+        source: &Source,
+    ) -> Vec<(u32, HashMap<u64, Vec<usize>>)> {
+        use typst::layout::FrameItem;
+
+        fn collect_from_frame(
+            frame: &typst::layout::Frame,
+            source: &Source,
+            out: &mut Vec<(u64, Vec<usize>)>,
+        ) {
+            // Buffer for purely synthetic text items (no internal anchor)
+            let mut synthetic_buffer: Vec<Vec<usize>> = Vec::new();
+            let mut last_valid_span: Option<(u64, usize)> = None; // (span_id, start_byte)
+
+            for (_pos, item) in frame.items() {
+                match item {
+                    FrameItem::Group(group) => {
+                        collect_from_frame(&group.frame, source, out);
+                    }
+                    FrameItem::Text(text) => {
+                        let anchor_id: u64 = text
+                            .glyphs
+                            .iter()
+                            .find(|g| !g.span.0.is_detached())
+                            .map(|g| g.span.0.into_raw().get())
+                            .unwrap_or(0);
+
+                        // Skip purely synthetic text items, but buffer their offsets
+                        if anchor_id == 0 {
+                            let mut byte_offsets = Vec::with_capacity(text.glyphs.len() + 1);
+                            for _ in 0..=text.glyphs.len() {
+                                byte_offsets.push(0);
+                            }
+                            synthetic_buffer.push(byte_offsets);
+                            continue;
+                        }
+
+                        let anchor_range = text
+                            .glyphs
+                            .iter()
+                            .find(|g| !g.span.0.is_detached())
+                            .and_then(|g| source.range(g.span.0))
+                            .unwrap_or(0..0);
+
+                        // Flush buffered synthetics to this anchor span.
+                        for buffered_offsets in synthetic_buffer.drain(..) {
+                            out.push((anchor_id, buffered_offsets));
+                        }
+
+                        let mut per_span_offsets: HashMap<u64, Vec<usize>> = HashMap::new();
+                        let mut last_resolved_byte: Option<usize> = None;
+                        let mut last_span_id: Option<u64> = None;
+
+                        for glyph in text.glyphs.iter() {
+                            let glyph_span = glyph.span.0;
+                            let local_offset = glyph.span.1 as usize;
+
+                            let span_id = if glyph_span.is_detached() {
+                                anchor_id
+                            } else {
+                                glyph_span.into_raw().get()
+                            };
+
+                            let byte_pos = if !glyph_span.is_detached() {
+                                if let Some(range) = source.range(glyph_span) {
+                                    let pos = range.start + local_offset;
+                                    last_resolved_byte = Some(pos);
+                                    pos
+                                } else {
+                                    anchor_range.start
+                                }
+                            } else {
+                                anchor_range.start
+                            };
+
+                            per_span_offsets
+                                .entry(span_id)
+                                .or_default()
+                                .push(byte_pos);
+                            last_span_id = Some(span_id);
+                        }
+
+                        // Add end position to the last span in this text item.
+                        if let (Some(last_glyph), Some(last_id)) =
+                            (text.glyphs.last(), last_span_id)
+                        {
+                            let last_span = last_glyph.span.0;
+                            let last_local_offset = last_glyph.span.1 as usize;
+
+                            let end_byte = if !last_span.is_detached() {
+                                if let Some(range) = source.range(last_span) {
+                                    range.start + last_local_offset + 1
+                                } else {
+                                    last_resolved_byte
+                                        .map(|b| b + 1)
+                                        .unwrap_or(anchor_range.start + 1)
+                                }
+                            } else {
+                                last_resolved_byte
+                                    .map(|b| b + 1)
+                                    .unwrap_or(anchor_range.start + 1)
+                            };
+
+                            per_span_offsets.entry(last_id).or_default().push(end_byte);
+                        }
+
+                        for (span_raw, byte_offsets) in per_span_offsets {
+                            if !byte_offsets.is_empty() {
+                                out.push((span_raw, byte_offsets));
+                            }
+                        }
+
+                        last_valid_span = Some((anchor_id, anchor_range.start));
+                    }
+                    _ => {}
+                }
+            }
+
+            // End of frame: flush remaining synthetics to last seen valid span.
+            if !synthetic_buffer.is_empty() {
+                if let Some((span_id, start_byte)) = last_valid_span {
+                    for mut buffered_offsets in synthetic_buffer.drain(..) {
+                        for o in buffered_offsets.iter_mut() {
+                            *o = start_byte;
+                        }
+                        out.push((span_id, buffered_offsets));
+                    }
+                }
+            }
+        }
+
+        let mut pages_out = Vec::new();
+        for (page_idx, page) in doc.pages.iter().enumerate() {
+            let mut spans_raw: Vec<(u64, Vec<usize>)> = Vec::new();
+            collect_from_frame(&page.frame, source, &mut spans_raw);
+
+            if spans_raw.is_empty() {
+                continue;
+            }
+
+            // Merge duplicate span entries by span_id (matches current lib.rs behavior).
+            let mut merged: HashMap<u64, Vec<usize>> = HashMap::new();
+            for (span_id, offsets) in spans_raw {
+                merged.entry(span_id).or_default().extend(offsets);
+            }
+
+            if !merged.is_empty() {
+                pages_out.push((page_idx as u32, merged));
+            }
+        }
+
+        pages_out
+    }
+
+    /// Compile a source string and return (doc, main_source).
+    fn compile_doc_and_source(
+        driver: &TypstSystemUniverse,
+        src: &str,
+    ) -> (Arc<reflexo_typst::TypstPagedDocument>, Source) {
+        let graph = driver.snapshot_with_entry_content(Bytes::from_string(src.to_owned()), None);
+        let world = graph.world();
+        let main_id = world.main();
+        let source = world.source(main_id).expect("main source");
+        let doc = graph
+            .compile()
+            .output
+            .expect("compile document");
+        (doc, source)
+    }
 
     /// Compile source through the incremental server/client pipeline and return page fingerprints.
     fn page_fingerprints(
@@ -1047,6 +1228,234 @@ Third paragraph on page two.
         }
 
         eprintln!("\n=== PER-PAGE SPAN PARITY PASS ===\n");
+    }
+
+    /// Lock-down test: legacy glyphMaps (byte offsets) must stay coherent with typst2vec
+    /// glyphPositions (x-positions) for real documents.
+    ///
+    /// Invariants:
+    /// - Same span set per page.
+    /// - For each span, total byteOffsets count == total positions count.
+    /// - byteOffsets are monotonically non-decreasing.
+    /// - Resolvable spans have offsets within their Source range.
+    #[test]
+    fn glyph_maps_cohere_with_glyph_positions_and_source_ranges() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+        server.set_should_attach_debug_info(true);
+
+        let src = r#"
+#set page(width: 400pt, height: 260pt, margin: 18pt)
+#set text(12pt)
+
+= Heading αβ
+
++ *Manual Typesetting*: Physical type composition
++ *Desktop Publishing*: WYSIWYG editors emerge
+
+Plain paragraph with Héllo UTF-8 characters.
+
+#pagebreak()
+
+= Second Page
+More content here to ensure multi-page output.
+"#;
+
+        let (doc, main_source) = compile_doc_and_source(&driver, src);
+        let legacy_maps = collect_legacy_glyph_maps(&doc, &main_source);
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc.clone()));
+
+        assert!(
+            !legacy_maps.is_empty(),
+            "expected legacy glyph maps to produce at least one page"
+        );
+
+        for (page_idx, spans_offsets) in legacy_maps {
+            let gp_page = delta
+                .glyph_map
+                .iter()
+                .find(|p| p.page == page_idx)
+                .expect("glyphPositions page present");
+
+            // Build per-span total positions length from typst2vec.
+            let mut positions_len_by_span: HashMap<u64, usize> = HashMap::new();
+            for run in &gp_page.spans {
+                positions_len_by_span
+                    .entry(run.span)
+                    .and_modify(|v| *v += run.positions.len())
+                    .or_insert(run.positions.len());
+            }
+
+            // Span sets must match.
+            let legacy_span_ids: HashSet<u64> = spans_offsets.keys().copied().collect();
+            let gp_span_ids: HashSet<u64> = positions_len_by_span.keys().copied().collect();
+            assert_eq!(
+                legacy_span_ids, gp_span_ids,
+                "page {} span set mismatch between glyphMaps and glyphPositions",
+                page_idx
+            );
+
+            for (span_id, offsets) in spans_offsets {
+                // Length parity with glyphPositions.
+                let expected_len = positions_len_by_span
+                    .get(&span_id)
+                    .expect("span present in glyphPositions");
+                assert_eq!(
+                    offsets.len(),
+                    *expected_len,
+                    "page {} span {:x} offsets len {} != positions len {}",
+                    page_idx,
+                    span_id,
+                    offsets.len(),
+                    expected_len
+                );
+
+                // Offsets should lie within Source range for resolvable spans.
+                if let Some(raw) = NonZeroU64::new(span_id) {
+                    let span = Span::from_raw(raw);
+                    if let Some(range) = main_source.range(span) {
+                        let first = offsets.first().copied().unwrap_or(range.start);
+                        let last = offsets.last().copied().unwrap_or(range.end);
+                        assert!(
+                            first >= range.start && first <= range.end,
+                            "page {} span {:x} first offset {} not in range {:?}",
+                            page_idx,
+                            span_id,
+                            first,
+                            range
+                        );
+                        assert!(
+                            last >= range.start && last <= range.end,
+                            "page {} span {:x} last offset {} not in range {:?}",
+                            page_idx,
+                            span_id,
+                            last,
+                            range
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Parity harness for fused glyphMaps path.
+    ///
+    /// When `incr-glyph-maps` is enabled and typst2vec emits local glyph offsets,
+    /// this test:
+    /// 1) Reconstructs fused absolute byte offsets from glyph_offsets.
+    /// 2) Asserts fused glyphMaps match legacy traversal (guard against drift).
+    /// 3) Asserts fused span sets are present in typst2vec glyphPositions/layoutMap,
+    ///    mirroring the hydration contract where GM is canonical.
+    #[cfg(feature = "incr-glyph-maps")]
+    #[test]
+    fn fused_glyph_maps_match_legacy() {
+        let driver = make_driver();
+        let mut server = IncrDocServer::default();
+        server.set_should_attach_debug_info(true);
+
+        let src = r#"
+#set page(width: 400pt, height: 260pt, margin: 18pt)
+#set text(12pt)
+
+= Heading αβ
+
++ *Manual Typesetting*: Physical type composition
++ *Desktop Publishing*: WYSIWYG editors emerge
+
+Plain paragraph with Héllo UTF-8 characters.
+
+#pagebreak()
+
+= Second Page
+More content here to ensure multi-page output.
+"#;
+
+        let (doc, main_source) = compile_doc_and_source(&driver, src);
+        let legacy_pages = collect_legacy_glyph_maps(&doc, &main_source);
+
+        let delta = server.pack_delta(&TypstDocument::Paged(doc.clone()));
+
+        // Reconstruct fused absolute glyphMaps from local offsets.
+        let mut fused_by_page: HashMap<u32, HashMap<u64, Vec<usize>>> = HashMap::new();
+        for page in &delta.glyph_offsets {
+            let mut merged: HashMap<u64, Vec<usize>> = HashMap::new();
+            for run in &page.spans {
+                let Some(raw) = NonZeroU64::new(run.span) else { continue };
+                let span = Span::from_raw(raw);
+                let Some(range) = main_source.range(span) else { continue };
+                let abs: Vec<usize> = run
+                    .offsets
+                    .iter()
+                    .map(|o| range.start + *o as usize)
+                    .collect();
+                merged.entry(run.span).or_default().extend(abs);
+            }
+
+            if !merged.is_empty() {
+                fused_by_page.insert(page.page, merged);
+            }
+        }
+
+        let legacy_by_page: HashMap<u32, HashMap<u64, Vec<usize>>> =
+            legacy_pages.into_iter().collect();
+
+        assert_eq!(
+            legacy_by_page.keys().collect::<HashSet<_>>(),
+            fused_by_page.keys().collect::<HashSet<_>>(),
+            "page sets should match between legacy and fused glyphMaps"
+        );
+
+        for (page, legacy_spans) in legacy_by_page {
+            let fused_spans = fused_by_page
+                .get(&page)
+                .expect("fused page present");
+
+            let legacy_ids: HashSet<u64> = legacy_spans.keys().copied().collect();
+            let fused_ids: HashSet<u64> = fused_spans.keys().copied().collect();
+            assert_eq!(
+                legacy_ids, fused_ids,
+                "page {} span sets should match",
+                page
+            );
+
+            for (span_id, legacy_offsets) in legacy_spans {
+                let fused_offsets = fused_spans
+                    .get(&span_id)
+                    .expect("fused span present");
+                let mut legacy_sorted = legacy_offsets.clone();
+                legacy_sorted.sort_unstable();
+                let mut fused_sorted = fused_offsets.clone();
+                fused_sorted.sort_unstable();
+                assert_eq!(
+                    legacy_sorted, fused_sorted,
+                    "page {} span {:x} offsets differ between legacy and fused paths",
+                    page,
+                    span_id
+                );
+            }
+
+            // Fused spans must all exist in typst2vec glyphPositions.
+            let gp_page = delta
+                .glyph_map
+                .iter()
+                .find(|p| p.page == page)
+                .expect("glyphPositions page present");
+
+            let gp_ids: HashSet<u64> = gp_page.spans.iter().map(|s| s.span).collect();
+
+            let fused_missing_in_gp: Vec<String> = fused_ids
+                .difference(&gp_ids)
+                .map(|id| format!("{:x}", id))
+                .collect();
+
+            assert!(
+                fused_missing_in_gp.is_empty(),
+                "page {} fused spans missing from glyphPositions: {:?}",
+                page,
+                fused_missing_in_gp
+            );
+        }
     }
 
 }

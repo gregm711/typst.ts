@@ -5365,6 +5365,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "typst-ts-bench-incremental-sweep"
+version = "0.7.0-rc1"
+dependencies = [
+ "comemo",
+ "divan",
+ "reflexo-typst",
+ "reflexo-typst2vec",
+ "typst",
+ "typst-ts-cli",
+]
+
+[[package]]
 name = "typst-ts-bench-lowering"
 version = "0.7.0-rc1"
 dependencies = [

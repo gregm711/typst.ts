@@ -16,6 +16,9 @@ mod test_glyph_maps;
 #[cfg(all(test, feature = "incr"))]
 mod test_span_comparison;
 
+#[cfg(all(test, feature = "incr", feature = "incr-glyph-maps"))]
+mod test_hydration_parity;
+
 pub use crate::builder::TypstFontResolver;
 pub use reflexo_typst::*;
 
@@ -154,6 +157,56 @@ pub(crate) struct PageGlyphMap {
     version: u32,
     /// Glyph maps for all text spans on this page
     spans: Vec<SpanGlyphMap>,
+}
+
+/// Fuse glyphMaps from typst2vec local glyph offsets + spanRanges.
+/// This mirrors the incr_compile fusing logic so hydration can share it.
+#[cfg(all(feature = "incr", feature = "incr-glyph-maps"))]
+fn fuse_glyph_maps_from_offsets(
+    glyph_offsets_pages: Vec<reflexo_typst2vec::layout::PageGlyphOffsets>,
+    span_ranges: &[(String, u32, usize, usize)],
+) -> Vec<PageGlyphMap> {
+    use std::collections::HashMap;
+
+    // Build span start lookup (hex -> u64).
+    let mut span_start: HashMap<u64, usize> = HashMap::new();
+    for (span_hex, _file_id, start, _end) in span_ranges {
+        if let Ok(raw) = u64::from_str_radix(span_hex, 16) {
+            span_start.insert(raw, *start);
+        }
+    }
+
+    let mut fused_pages: Vec<PageGlyphMap> = Vec::new();
+    for page in glyph_offsets_pages {
+        let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
+        for run in page.spans {
+            let Some(start) = span_start.get(&run.span) else {
+                // Unresolvable/generated span, skip to keep parity with glyphPositions filter.
+                continue;
+            };
+            let span_hex = format!("{:x}", run.span);
+            let abs_offsets: Vec<usize> =
+                run.offsets.iter().map(|o| start + *o as usize).collect();
+            merged.entry(span_hex).or_default().extend(abs_offsets);
+        }
+
+        if !merged.is_empty() {
+            let spans: Vec<SpanGlyphMap> = merged
+                .into_iter()
+                .map(|(span_id, byte_offsets)| SpanGlyphMap {
+                    span_id,
+                    byte_offsets,
+                })
+                .collect();
+            fused_pages.push(PageGlyphMap {
+                page: page.page,
+                version: 1,
+                spans,
+            });
+        }
+    }
+
+    fused_pages
 }
 
 /// Internal helper for geometric line verification.
@@ -1028,59 +1081,108 @@ impl TypstCompileWorld {
             return self.get_diag::<TypstPagedDocument>(diagnostics_format);
         };
 
-        // Collect glyph maps for accurate click-to-cursor positioning
-        // Filter to only requested pages if page_filter is set
-        let glyph_maps = self.collect_glyph_maps(&doc, page_filter.as_ref());
+        // Collect glyph maps for accurate click-to-cursor positioning.
+        // In `incr-glyph-maps` builds we will fuse these from typst2vec output
+        // after the delta is produced; otherwise fall back to legacy traversal.
+        let mut glyph_maps = {
+            #[cfg(not(feature = "incr-glyph-maps"))]
+            {
+                // Filter to only requested pages if page_filter is set
+                self.collect_glyph_maps(&doc, page_filter.as_ref())
+            }
+            #[cfg(feature = "incr-glyph-maps")]
+            {
+                Vec::new()
+            }
+        };
 
         // Get total page count BEFORE moving doc into state.update()
         let total_page_count = doc.pages.len() as u32;
 
-        let delta = state.update(doc);
+        let mut delta = state.update(doc);
         let v = Uint8Array::from(delta.bytes.as_slice()).into();
 
-        // Resolve span ranges from the world for source mapping
+        // Resolve span ranges from the world for source mapping.
+        // Cache once per successful incr_compile for hydration to reuse.
         let span_ranges = self.resolve_span_ranges(&delta.bytes);
+        #[cfg(feature = "incr-glyph-maps")]
+        state.set_cached_span_ranges(span_ranges.clone());
         let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
 
+        // Fuse glyph maps from typst2vec local offsets to avoid a second frame traversal.
+        #[cfg(feature = "incr-glyph-maps")]
+        {
+            // Filter pages if requested.
+            let glyph_offsets_pages = {
+                let glyph_offsets = std::mem::take(&mut delta.glyph_offsets);
+                if let Some(filter) = &page_filter {
+                    glyph_offsets
+                        .into_iter()
+                        .filter(|gp| filter.contains(&gp.page))
+                        .collect::<Vec<_>>()
+                } else {
+                    glyph_offsets
+                }
+            };
+
+            glyph_maps = fuse_glyph_maps_from_offsets(glyph_offsets_pages, &span_ranges);
+        }
+
         // Filter glyph positions by page if filter is active
-        let glyph_positions = if let Some(filter) = &page_filter {
-            delta.glyph_map.iter()
-                .filter(|gp| filter.contains(&gp.page))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            delta.glyph_map.clone()
+        let glyph_positions = {
+            let glyph_map = std::mem::take(&mut delta.glyph_map);
+            if let Some(filter) = &page_filter {
+                glyph_map
+                    .into_iter()
+                    .filter(|gp| filter.contains(&gp.page))
+                    .collect::<Vec<_>>()
+            } else {
+                glyph_map
+            }
         };
 
         // Keep glyph positions/layout coherent with glyph maps: only emit spans that
         // have byte offsets. This prevents orphan spans (e.g., generated content) from
         // reaching the client.
-        let span_ids: std::collections::HashSet<String> = glyph_maps
+        let span_ids: std::collections::HashSet<u64> = glyph_maps
             .iter()
-            .flat_map(|page| page.spans.iter().map(|s| s.span_id.clone()))
+            .flat_map(|page| {
+                page.spans.iter().filter_map(|s| u64::from_str_radix(&s.span_id, 16).ok())
+            })
             .collect();
+
+        let pre_filter_span_count: usize = if cfg!(debug_assertions) {
+            glyph_positions.iter().map(|p| p.spans.len()).sum()
+        } else {
+            0
+        };
 
         // DEBUG: Log span counts before filtering to identify what's being dropped
         if cfg!(debug_assertions) {
-            let pre_filter_span_count: usize = glyph_positions.iter().map(|p| p.spans.len()).sum();
-            let glyph_positions_span_ids: std::collections::HashSet<String> = glyph_positions
+            let glyph_positions_span_ids: std::collections::HashSet<u64> = glyph_positions
                 .iter()
-                .flat_map(|page| page.spans.iter().map(|s| format!("{:x}", s.span)))
+                .flat_map(|page| page.spans.iter().map(|s| s.span))
                 .collect();
 
             // Find spans that are in glyph_positions but NOT in glyph_maps (will be filtered out)
-            let dropped_spans: Vec<&String> = glyph_positions_span_ids
+            let dropped_spans: Vec<u64> = glyph_positions_span_ids
                 .iter()
-                .filter(|id| !span_ids.contains(*id))
+                .filter(|id| !span_ids.contains(id))
+                .copied()
                 .collect();
 
             if !dropped_spans.is_empty() || page_filter.is_some() {
+                let sample: Vec<String> = dropped_spans
+                    .iter()
+                    .take(10)
+                    .map(|s| format!("{:x}", s))
+                    .collect();
                 console_log(format!(
                     "[incr_compile] SPAN FILTER DEBUG: glyphMaps has {} unique spans, glyphPositions has {} unique spans, dropping {} spans: {:?}",
                     span_ids.len(),
                     glyph_positions_span_ids.len(),
                     dropped_spans.len(),
-                    dropped_spans.iter().take(10).collect::<Vec<_>>()
+                    sample
                 ));
             }
         }
@@ -1141,9 +1243,9 @@ impl TypstCompileWorld {
             .into_iter()
             .map(|mut page| {
                 let before = page.spans.len();
-                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page.spans.retain(|s| span_ids.contains(&s.span));
                 let after = page.spans.len();
-                if before != after {
+                if cfg!(debug_assertions) && before != after {
                     console_log(format!(
                         "[incr_compile] Page {} filtered: {} -> {} spans ({} dropped)",
                         page.page, before, after, before - after
@@ -1154,7 +1256,7 @@ impl TypstCompileWorld {
             .collect::<Vec<_>>();
 
         let post_filter_span_count: usize = filtered_glyph_positions.iter().map(|p| p.spans.len()).sum();
-        if pre_filter_span_count != post_filter_span_count {
+        if cfg!(debug_assertions) && pre_filter_span_count != post_filter_span_count {
             console_log(format!(
                 "[incr_compile] TOTAL SPANS FILTERED: {} -> {} ({} dropped)",
                 pre_filter_span_count, post_filter_span_count, pre_filter_span_count - post_filter_span_count
@@ -1164,15 +1266,19 @@ impl TypstCompileWorld {
         // Serialize glyph maps for accurate click positioning
         let glyph_maps_js = match serde_wasm_bindgen::to_value(&glyph_maps) {
             Ok(v) => {
-                console_log(format!(
-                    "[incr_compile] Serialized glyph maps: {} pages, is_null={}",
-                    glyph_maps.len(),
-                    v.is_null()
-                ));
+                if cfg!(debug_assertions) {
+                    console_log(format!(
+                        "[incr_compile] Serialized glyph maps: {} pages, is_null={}",
+                        glyph_maps.len(),
+                        v.is_null()
+                    ));
+                }
                 v
             }
             Err(e) => {
-                console_log(format!("[incr_compile] ERROR serializing glyph maps: {:?}", e));
+                if cfg!(debug_assertions) {
+                    console_log(format!("[incr_compile] ERROR serializing glyph maps: {:?}", e));
+                }
                 JsValue::NULL
             }
         };
@@ -1186,13 +1292,16 @@ impl TypstCompileWorld {
         let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
 
         // Filter layout map by page if filter is active
-        let layout_map = if let Some(filter) = &page_filter {
-            delta.layout_map.iter()
-                .filter(|lp| filter.contains(&lp.page))
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            delta.layout_map.clone()
+        let layout_map = {
+            let layout_map = std::mem::take(&mut delta.layout_map);
+            if let Some(filter) = &page_filter {
+                layout_map
+                    .into_iter()
+                    .filter(|lp| filter.contains(&lp.page))
+                    .collect::<Vec<_>>()
+            } else {
+                layout_map
+            }
         };
 
         // Apply the SAME span_ids filter to layoutMap that we apply to glyphPositions
@@ -1201,7 +1310,7 @@ impl TypstCompileWorld {
         let filtered_layout_map = layout_map
             .into_iter()
             .map(|mut page| {
-                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page.spans.retain(|s| span_ids.contains(&s.span));
                 page
             })
             .collect::<Vec<_>>();
@@ -1209,47 +1318,62 @@ impl TypstCompileWorld {
         let layout_map_js =
             serde_wasm_bindgen::to_value(&filtered_layout_map).unwrap_or(JsValue::NULL);
 
-        // Log filtering info
-        if let Some(filter) = &page_filter {
-            console_log(format!(
-                "[incr_compile] Page filter active: {} pages requested, {} total pages. Returning {} glyph_positions, {} layout_map entries",
-                filter.len(),
-                total_page_count,
-                filtered_glyph_positions.len(),
-                filtered_layout_map.len()
-            ));
+        // Log filtering info (debug-only to avoid wasm console overhead on hot path)
+        if cfg!(debug_assertions) {
+            if let Some(filter) = &page_filter {
+                console_log(format!(
+                    "[incr_compile] Page filter active: {} pages requested, {} total pages. Returning {} glyph_positions, {} layout_map entries",
+                    filter.len(),
+                    total_page_count,
+                    filtered_glyph_positions.len(),
+                    filtered_layout_map.len()
+                ));
 
-            // CARMACK: Diff span IDs between glyphMaps and glyphPositions BEFORE JS serialization
-            for page_num in filter.iter() {
-                let gm_page = glyph_maps.iter().find(|p| p.page == *page_num);
-                let gp_page = filtered_glyph_positions.iter().find(|p| p.page == *page_num);
+                // CARMACK: Diff span IDs between glyphMaps and glyphPositions BEFORE JS serialization
+                for page_num in filter.iter() {
+                    let gm_page = glyph_maps.iter().find(|p| p.page == *page_num);
+                    let gp_page = filtered_glyph_positions.iter().find(|p| p.page == *page_num);
 
-                let gm_span_ids: HashSet<String> = gm_page
-                    .map(|p| p.spans.iter().map(|s| s.span_id.clone()).collect())
-                    .unwrap_or_default();
-                let gp_span_ids: HashSet<String> = gp_page
-                    .map(|p| p.spans.iter().map(|s| format!("{:x}", s.span)).collect())
-                    .unwrap_or_default();
+                    let gm_span_ids: HashSet<String> = gm_page
+                        .map(|p| p.spans.iter().map(|s| s.span_id.clone()).collect())
+                        .unwrap_or_default();
+                    let gp_span_ids: HashSet<String> = gp_page
+                        .map(|p| p.spans.iter().map(|s| format!("{:x}", s.span)).collect())
+                        .unwrap_or_default();
 
-                let in_gm_not_gp: Vec<_> = gm_span_ids.difference(&gp_span_ids).collect();
-                let in_gp_not_gm: Vec<_> = gp_span_ids.difference(&gm_span_ids).collect();
+                    let in_gm_not_gp: Vec<_> = gm_span_ids.difference(&gp_span_ids).collect();
+                    let in_gp_not_gm: Vec<_> = gp_span_ids.difference(&gm_span_ids).collect();
 
-                if !in_gm_not_gp.is_empty() || !in_gp_not_gm.is_empty() {
-                    console_log(format!("[SPAN_MISMATCH_RUST] Page {}:", page_num));
-                    if !in_gm_not_gp.is_empty() {
-                        let sample: Vec<_> = in_gm_not_gp.iter().take(5).collect();
-                        console_log(format!("  In glyphMaps but NOT glyphPositions ({}): {:?}", in_gm_not_gp.len(), sample));
-                    }
-                    if !in_gp_not_gm.is_empty() {
-                        let sample: Vec<_> = in_gp_not_gm.iter().take(5).collect();
-                        console_log(format!("  In glyphPositions but NOT glyphMaps ({}): {:?}", in_gp_not_gm.len(), sample));
+                    if !in_gm_not_gp.is_empty() || !in_gp_not_gm.is_empty() {
+                        console_log(format!("[SPAN_MISMATCH_RUST] Page {}:", page_num));
+                        if !in_gm_not_gp.is_empty() {
+                            let sample: Vec<_> = in_gm_not_gp.iter().take(5).collect();
+                            console_log(format!(
+                                "  In glyphMaps but NOT glyphPositions ({}): {:?}",
+                                in_gm_not_gp.len(),
+                                sample
+                            ));
+                        }
+                        if !in_gp_not_gm.is_empty() {
+                            let sample: Vec<_> = in_gp_not_gm.iter().take(5).collect();
+                            console_log(format!(
+                                "  In glyphPositions but NOT glyphMaps ({}): {:?}",
+                                in_gp_not_gm.len(),
+                                sample
+                            ));
+                        }
                     }
                 }
             }
         }
 
         Ok(if diagnostics_format != 0 {
-            console_log(format!("[incr_compile] Building result object with diagnostics_format={}", diagnostics_format));
+            if cfg!(debug_assertions) {
+                console_log(format!(
+                    "[incr_compile] Building result object with diagnostics_format={}",
+                    diagnostics_format
+                ));
+            }
             let result = js_sys::Object::new();
             js_sys::Reflect::set(&result, &"result".into(), &v)?;
             js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
@@ -1265,10 +1389,20 @@ impl TypstCompileWorld {
                 let filtered_pages_js = serde_wasm_bindgen::to_value(&filtered_pages).unwrap_or(JsValue::NULL);
                 js_sys::Reflect::set(&result, &"filteredPages".into(), &filtered_pages_js)?;
             }
-            console_log(format!("[incr_compile] Result object created, glyphMaps set (value is_null={})", glyph_maps_js.is_null()));
+            if cfg!(debug_assertions) {
+                console_log(format!(
+                    "[incr_compile] Result object created, glyphMaps set (value is_null={})",
+                    glyph_maps_js.is_null()
+                ));
+            }
             result.into()
         } else {
-            console_log("[incr_compile] diagnostics_format is 0, returning raw delta (no glyphMaps)".to_string());
+            if cfg!(debug_assertions) {
+                console_log(
+                    "[incr_compile] diagnostics_format is 0, returning raw delta (no glyphMaps)"
+                        .to_string(),
+                );
+            }
             // For backwards compatibility, just return delta if no diag format
             v
         })
@@ -1302,7 +1436,9 @@ impl TypstCompileWorld {
 
         // Get cached doc from IncrServer
         let Some(doc) = state.cached_doc() else {
-            console_log("[extract_glyph_data] No cached document".to_string());
+            if cfg!(debug_assertions) {
+                console_log("[extract_glyph_data] No cached document".to_string());
+            }
             return Ok(JsValue::NULL);
         };
 
@@ -1313,26 +1449,61 @@ impl TypstCompileWorld {
             ));
         }
 
-        // Extract glyphMaps (byte offsets) using existing logic
-        let glyph_maps = self.collect_glyph_maps(doc, Some(&page_set));
+        // Extract glyphMaps + glyphPositions + layoutMap.
+        // In incr-glyph-maps builds, fuse glyphMaps from typst2vec glyph_offsets
+        // to guarantee parity by construction.
+        let (glyph_maps, layout_map, glyph_positions) = {
+            #[cfg(feature = "incr-glyph-maps")]
+            {
+                let span_ranges = match state.cached_span_ranges() {
+                    Some(ranges) => ranges.clone(),
+                    None => self.resolve_span_ranges(&[]),
+                };
 
-        // Extract glyphPositions (X/Y coordinates) using IncrServer's new method
-        let Some((layout_map, glyph_positions)) = state.extract_glyph_positions_for_pages(&page_set) else {
-            console_log("[extract_glyph_data] Failed to extract glyph positions".to_string());
-            return Ok(JsValue::NULL);
+                let Some((layout_map, glyph_positions, glyph_offsets)) =
+                    state.extract_glyph_positions_and_offsets_for_pages(&page_set)
+                else {
+                    if cfg!(debug_assertions) {
+                        console_log(
+                            "[extract_glyph_data] Failed to extract glyph positions/offsets"
+                                .to_string(),
+                        );
+                    }
+                    return Ok(JsValue::NULL);
+                };
+
+                let glyph_maps = fuse_glyph_maps_from_offsets(glyph_offsets, &span_ranges);
+                (glyph_maps, layout_map, glyph_positions)
+            }
+            #[cfg(not(feature = "incr-glyph-maps"))]
+            {
+                // Legacy path: glyphMaps via separate frame traversal.
+                let glyph_maps = self.collect_glyph_maps(doc, Some(&page_set));
+                let Some((layout_map, glyph_positions)) =
+                    state.extract_glyph_positions_for_pages(&page_set)
+                else {
+                    if cfg!(debug_assertions) {
+                        console_log("[extract_glyph_data] Failed to extract glyph positions".to_string());
+                    }
+                    return Ok(JsValue::NULL);
+                };
+                (glyph_maps, layout_map, glyph_positions)
+            }
         };
 
         // Filter glyphPositions to only include spans that have byte offsets in glyphMaps.
         // This ensures parity and prevents orphan spans (generated content without source mapping).
-        let span_ids: std::collections::HashSet<String> = glyph_maps
+        let span_ids: std::collections::HashSet<u64> = glyph_maps
             .iter()
-            .flat_map(|page| page.spans.iter().map(|s| s.span_id.clone()))
+            .flat_map(|page| {
+                page.spans.iter().filter_map(|s| u64::from_str_radix(&s.span_id, 16).ok())
+            })
             .collect();
 
         let filtered_glyph_positions: Vec<_> = glyph_positions
             .into_iter()
             .map(|mut page| {
-                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page.spans.retain(|s| span_ids.contains(&s.span));
                 page
             })
             .collect();
@@ -1341,7 +1512,7 @@ impl TypstCompileWorld {
         let filtered_layout_map: Vec<_> = layout_map
             .into_iter()
             .map(|mut page| {
-                page.spans.retain(|s| span_ids.contains(&format!("{:x}", s.span)));
+                page.spans.retain(|s| span_ids.contains(&s.span));
                 page
             })
             .collect();
@@ -2150,7 +2321,7 @@ impl TypstCompileWorld {
             if end_max > start_min {
                 let span = end_max - start_min;
                 if span > 500 {
-                    if out.len() < 3 {
+                    if cfg!(debug_assertions) && out.len() < 3 {
                         console_log(format!(
                             "[LineFrame DROP] hint='{}' span={} (no direct text) at ty={:.2}pt",
                             if hint.is_ascii_graphic() || hint == ' ' { hint } else { '?' },

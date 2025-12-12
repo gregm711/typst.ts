@@ -476,7 +476,9 @@ impl SemaTask {
             }
             // todo: implement in svg
             SizedRawHtml(h) => {
-                web_sys::console::log_1(&format!("Html: {}", h.html).into());
+                if cfg!(debug_assertions) {
+                    web_sys::console::log_1(&format!("Html: {}", h.html).into());
+                }
                 output.push(Cow::Borrowed(r#"<span class="typst-content-html""#));
                 let is_regular_scale = ts.sx == 1.0 && ts.sy == 1.0;
                 let is_regular_skew = ts.kx == 0.0 && ts.ky == 0.0;

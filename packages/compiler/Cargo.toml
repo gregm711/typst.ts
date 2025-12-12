@@ -55,7 +55,7 @@ tiny-skia-path.workspace = true
 
 [features]
 full = ["web", "web_test", "fonts", "misc"]
-misc = ["incr", "svg", "pdf", "ast", "semantic_tokens"]
+misc = ["incr", "svg", "pdf", "ast", "semantic_tokens", "incr-glyph-maps"]
 
 web = ["reflexo-typst/web"]
 web_test = ["typst-ts-test-common/web_artifacts"]
@@ -66,6 +66,9 @@ pdf = ["reflexo-typst/pdf"]
 svg = ["reflexo-typst/svg"]
 ast = ["reflexo-typst/ast"]
 semantic_tokens = []
+
+# Collect and fuse glyphMaps during typst2vec traversal.
+incr-glyph-maps = ["reflexo-typst2vec/incr-glyph-maps"]
 
 no-content-hint = [
     "reflexo-typst2vec/no-content-hint",
