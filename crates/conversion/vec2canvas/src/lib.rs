@@ -515,17 +515,19 @@ pub async fn exception_create_image_blob(blob: &Blob, image_elem: &HtmlImageElem
                 web_sys::Url::revoke_object_url(&data_url2).unwrap();
                 complete2.call0(&complete2).unwrap();
                 // let end = std::time::Instant::now();
-                web_sys::console::log_1(
-                    &format!(
-                        "err image loading in {:?} {:?} {:?} {}",
-                        // end - begin,
-                        0,
-                        js_sys::Reflect::get(&e, &"type".into()).unwrap(),
-                        js_sys::JSON::stringify(&e).unwrap(),
-                        data_url2,
-                    )
-                    .into(),
-                );
+                if cfg!(debug_assertions) {
+                    web_sys::console::log_1(
+                        &format!(
+                            "err image loading in {:?} {:?} {:?} {}",
+                            // end - begin,
+                            0,
+                            js_sys::Reflect::get(&e, &"type".into()).unwrap(),
+                            js_sys::JSON::stringify(&e).unwrap(),
+                            data_url2,
+                        )
+                        .into(),
+                    );
+                }
             });
 
             image_elem.set_onerror(Some(a.as_ref().unchecked_ref()));

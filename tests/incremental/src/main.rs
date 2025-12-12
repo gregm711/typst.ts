@@ -1339,10 +1339,14 @@ More content here to ensure multi-page output.
         }
     }
 
-    /// Optional parity harness for the future fused glyphMaps path.
+    /// Parity harness for fused glyphMaps path.
     ///
     /// When `incr-glyph-maps` is enabled and typst2vec emits local glyph offsets,
-    /// this test will compare fused absolute byte offsets against legacy traversal.
+    /// this test:
+    /// 1) Reconstructs fused absolute byte offsets from glyph_offsets.
+    /// 2) Asserts fused glyphMaps match legacy traversal (guard against drift).
+    /// 3) Asserts fused span sets are present in typst2vec glyphPositions/layoutMap,
+    ///    mirroring the hydration contract where GM is canonical.
     #[cfg(feature = "incr-glyph-maps")]
     #[test]
     fn fused_glyph_maps_match_legacy() {
@@ -1430,6 +1434,27 @@ More content here to ensure multi-page output.
                     span_id
                 );
             }
+
+            // Fused spans must all exist in typst2vec glyphPositions.
+            let gp_page = delta
+                .glyph_map
+                .iter()
+                .find(|p| p.page == page)
+                .expect("glyphPositions page present");
+
+            let gp_ids: HashSet<u64> = gp_page.spans.iter().map(|s| s.span).collect();
+
+            let fused_missing_in_gp: Vec<String> = fused_ids
+                .difference(&gp_ids)
+                .map(|id| format!("{:x}", id))
+                .collect();
+
+            assert!(
+                fused_missing_in_gp.is_empty(),
+                "page {} fused spans missing from glyphPositions: {:?}",
+                page,
+                fused_missing_in_gp
+            );
         }
     }
 

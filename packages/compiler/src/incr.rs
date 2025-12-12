@@ -4,6 +4,8 @@ use std::sync::Arc;
 use reflexo_typst::{TypstDocument, TypstPagedDocument};
 use reflexo_typst2vec::incr::{IncrDocServer, PackedDelta};
 use reflexo_typst2vec::layout::{PageGlyphPositions, PageLayout};
+#[cfg(feature = "incr-glyph-maps")]
+use reflexo_typst2vec::layout::PageGlyphOffsets;
 use reflexo_typst2vec::pass::IncrTypst2VecPass;
 use wasm_bindgen::prelude::*;
 
@@ -18,6 +20,10 @@ pub struct IncrServer {
     /// Cached document for on-demand glyph extraction (hydration).
     /// Updated on every successful compile.
     cached_doc: Option<Arc<TypstPagedDocument>>,
+    /// Cached span ranges for the cached document.
+    /// Populated once per successful incr_compile and reused for hydration.
+    #[cfg(feature = "incr-glyph-maps")]
+    cached_span_ranges: Option<Vec<(String, u32, usize, usize)>>,
 }
 
 impl Default for IncrServer {
@@ -27,6 +33,8 @@ impl Default for IncrServer {
             attach_debug_info: true,
             glyph_map_pages: None,
             cached_doc: None,
+            #[cfg(feature = "incr-glyph-maps")]
+            cached_span_ranges: None,
         };
         this.inner.set_should_attach_debug_info(true);
         this
@@ -37,6 +45,11 @@ impl IncrServer {
     pub(crate) fn update(&mut self, doc: Arc<TypstPagedDocument>) -> PackedDelta {
         // Cache doc for on-demand extraction (hydration)
         self.cached_doc = Some(doc.clone());
+        #[cfg(feature = "incr-glyph-maps")]
+        {
+            // New doc implies new span ranges.
+            self.cached_span_ranges = None;
+        }
 
         self.inner.pack_delta(&TypstDocument::Paged(doc))
     }
@@ -68,6 +81,42 @@ impl IncrServer {
         let (layout_map, glyph_map) = pass.paged_filtered(doc, pages);
 
         Some((layout_map, glyph_map))
+    }
+
+    /// Extract glyph positions and local glyph offsets for specific pages.
+    /// Used by hydration in incr-glyph-maps builds to fuse glyphMaps from the
+    /// same typst2vec traversal as glyphPositions/layoutMap.
+    #[cfg(feature = "incr-glyph-maps")]
+    pub(crate) fn extract_glyph_positions_and_offsets_for_pages(
+        &self,
+        pages: &HashSet<u32>,
+    ) -> Option<(Vec<PageLayout>, Vec<PageGlyphPositions>, Vec<PageGlyphOffsets>)> {
+        let doc = self.cached_doc.as_ref()?;
+
+        let mut pass = IncrTypst2VecPass::default();
+        pass.spans.set_should_attach_debug_info(self.attach_debug_info);
+
+        let (layout_map, glyph_positions, glyph_offsets) =
+            pass.paged_filtered_with_glyph_offsets(doc, pages);
+
+        Some((layout_map, glyph_positions, glyph_offsets))
+    }
+
+    /// Store span ranges for the current cached document.
+    #[cfg(feature = "incr-glyph-maps")]
+    pub(crate) fn set_cached_span_ranges(
+        &mut self,
+        ranges: Vec<(String, u32, usize, usize)>,
+    ) {
+        self.cached_span_ranges = Some(ranges);
+    }
+
+    /// Borrow cached span ranges if available.
+    #[cfg(feature = "incr-glyph-maps")]
+    pub(crate) fn cached_span_ranges(
+        &self,
+    ) -> Option<&Vec<(String, u32, usize, usize)>> {
+        self.cached_span_ranges.as_ref()
     }
 
     /// Get the cached document reference (for lib.rs to extract glyphMaps)
@@ -116,6 +165,10 @@ impl IncrServer {
             .set_should_attach_debug_info(self.attach_debug_info);
         self.glyph_map_pages = None;
         self.cached_doc = None;
+        #[cfg(feature = "incr-glyph-maps")]
+        {
+            self.cached_span_ranges = None;
+        }
     }
 
     /// Extract glyph positions (X/Y coordinates) for specific pages from the cached document.

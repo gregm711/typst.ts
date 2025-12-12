@@ -1088,6 +1088,129 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
         (layout_map, glyph_map)
     }
 
+    /// Like `paged_filtered`, but also returns per-glyph local byte offsets.
+    ///
+    /// Only available with `incr-glyph-maps` feature.
+    #[cfg(feature = "incr-glyph-maps")]
+    pub fn paged_filtered_with_glyph_offsets(
+        &self,
+        doc: &TypstPagedDocument,
+        page_filter: &HashSet<u32>,
+    ) -> (
+        Vec<PageLayout>,
+        Vec<PageGlyphPositions>,
+        Vec<crate::layout::PageGlyphOffsets>,
+    ) {
+        let doc_reg = self.spans.start();
+
+        let results: Vec<(PageLayout, PageGlyphPositions, crate::layout::PageGlyphOffsets)> = {
+            #[cfg(all(target_arch = "wasm32", not(feature = "wasm-threads")))]
+            {
+                doc.pages
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| page_filter.contains(&(*idx as u32)))
+                    .map(|(idx, p)| {
+                        let page_reg = self.spans.start();
+                        let layout = Arc::new(LayoutCollector::default());
+
+                        let state =
+                            State::new(&doc.introspector, p.frame.size().into_typst());
+                        let abs_ref = self.frame_(
+                            state,
+                            &p.frame,
+                            page_reg,
+                            idx,
+                            p.fill_or_transparent(),
+                            None,
+                            Some(layout.clone()),
+                        );
+
+                        self.spans.push_span(SourceRegion {
+                            region: doc_reg,
+                            idx: idx as u32,
+                            kind: SourceNodeKind::Page { region: page_reg },
+                            item: abs_ref,
+                        });
+
+                        layout.flush_orphans();
+
+                        (
+                            layout.to_page_layout(idx as u32),
+                            layout.to_page_glyph_map(idx as u32),
+                            layout.to_page_glyph_offsets(idx as u32),
+                        )
+                    })
+                    .collect()
+            }
+            #[cfg(not(all(target_arch = "wasm32", not(feature = "wasm-threads"))))]
+            {
+                doc.pages
+                    .par_iter()
+                    .enumerate()
+                    .filter(|(idx, _)| page_filter.contains(&(*idx as u32)))
+                    .map(|(idx, p)| {
+                        let page_reg = self.spans.start();
+                        let layout = Arc::new(LayoutCollector::default());
+
+                        let state =
+                            State::new(&doc.introspector, p.frame.size().into_typst());
+                        let abs_ref = self.frame_(
+                            state,
+                            &p.frame,
+                            page_reg,
+                            idx,
+                            p.fill_or_transparent(),
+                            None,
+                            Some(layout.clone()),
+                        );
+
+                        self.spans.push_span(SourceRegion {
+                            region: doc_reg,
+                            idx: idx as u32,
+                            kind: SourceNodeKind::Page { region: page_reg },
+                            item: abs_ref,
+                        });
+
+                        layout.flush_orphans();
+
+                        (
+                            layout.to_page_layout(idx as u32),
+                            layout.to_page_glyph_map(idx as u32),
+                            layout.to_page_glyph_offsets(idx as u32),
+                        )
+                    })
+                    .collect()
+            }
+        };
+
+        let (layout_map, glyph_map, glyph_offsets) =
+            results
+                .into_iter()
+                .fold((Vec::new(), Vec::new(), Vec::new()), |mut acc, (l, g, o)| {
+                    acc.0.push(l);
+                    acc.1.push(g);
+                    acc.2.push(o);
+                    acc
+                });
+
+        // Keep only spans that are present in glyph_map (resolvable spans).
+        let valid_spans: HashSet<u64> = glyph_map
+            .iter()
+            .flat_map(|p| p.spans.iter().map(|s| s.span))
+            .collect();
+
+        let layout_map = layout_map
+            .into_iter()
+            .map(|mut page| {
+                page.spans.retain(|s| valid_spans.contains(&s.span));
+                page
+            })
+            .collect();
+
+        (layout_map, glyph_map, glyph_offsets)
+    }
+
     fn frame(
         &self,
         state: State,

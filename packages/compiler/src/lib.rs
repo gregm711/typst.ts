@@ -16,6 +16,9 @@ mod test_glyph_maps;
 #[cfg(all(test, feature = "incr"))]
 mod test_span_comparison;
 
+#[cfg(all(test, feature = "incr", feature = "incr-glyph-maps"))]
+mod test_hydration_parity;
+
 pub use crate::builder::TypstFontResolver;
 pub use reflexo_typst::*;
 
@@ -154,6 +157,56 @@ pub(crate) struct PageGlyphMap {
     version: u32,
     /// Glyph maps for all text spans on this page
     spans: Vec<SpanGlyphMap>,
+}
+
+/// Fuse glyphMaps from typst2vec local glyph offsets + spanRanges.
+/// This mirrors the incr_compile fusing logic so hydration can share it.
+#[cfg(all(feature = "incr", feature = "incr-glyph-maps"))]
+fn fuse_glyph_maps_from_offsets(
+    glyph_offsets_pages: Vec<reflexo_typst2vec::layout::PageGlyphOffsets>,
+    span_ranges: &[(String, u32, usize, usize)],
+) -> Vec<PageGlyphMap> {
+    use std::collections::HashMap;
+
+    // Build span start lookup (hex -> u64).
+    let mut span_start: HashMap<u64, usize> = HashMap::new();
+    for (span_hex, _file_id, start, _end) in span_ranges {
+        if let Ok(raw) = u64::from_str_radix(span_hex, 16) {
+            span_start.insert(raw, *start);
+        }
+    }
+
+    let mut fused_pages: Vec<PageGlyphMap> = Vec::new();
+    for page in glyph_offsets_pages {
+        let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
+        for run in page.spans {
+            let Some(start) = span_start.get(&run.span) else {
+                // Unresolvable/generated span, skip to keep parity with glyphPositions filter.
+                continue;
+            };
+            let span_hex = format!("{:x}", run.span);
+            let abs_offsets: Vec<usize> =
+                run.offsets.iter().map(|o| start + *o as usize).collect();
+            merged.entry(span_hex).or_default().extend(abs_offsets);
+        }
+
+        if !merged.is_empty() {
+            let spans: Vec<SpanGlyphMap> = merged
+                .into_iter()
+                .map(|(span_id, byte_offsets)| SpanGlyphMap {
+                    span_id,
+                    byte_offsets,
+                })
+                .collect();
+            fused_pages.push(PageGlyphMap {
+                page: page.page,
+                version: 1,
+                spans,
+            });
+        }
+    }
+
+    fused_pages
 }
 
 /// Internal helper for geometric line verification.
@@ -1049,23 +1102,16 @@ impl TypstCompileWorld {
         let mut delta = state.update(doc);
         let v = Uint8Array::from(delta.bytes.as_slice()).into();
 
-        // Resolve span ranges from the world for source mapping
+        // Resolve span ranges from the world for source mapping.
+        // Cache once per successful incr_compile for hydration to reuse.
         let span_ranges = self.resolve_span_ranges(&delta.bytes);
+        #[cfg(feature = "incr-glyph-maps")]
+        state.set_cached_span_ranges(span_ranges.clone());
         let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
 
         // Fuse glyph maps from typst2vec local offsets to avoid a second frame traversal.
         #[cfg(feature = "incr-glyph-maps")]
         {
-            use std::collections::HashMap;
-
-            // Build span start lookup (hex -> u64).
-            let mut span_start: HashMap<u64, usize> = HashMap::new();
-            for (span_hex, _file_id, start, _end) in &span_ranges {
-                if let Ok(raw) = u64::from_str_radix(span_hex, 16) {
-                    span_start.insert(raw, *start);
-                }
-            }
-
             // Filter pages if requested.
             let glyph_offsets_pages = {
                 let glyph_offsets = std::mem::take(&mut delta.glyph_offsets);
@@ -1079,34 +1125,7 @@ impl TypstCompileWorld {
                 }
             };
 
-            let mut fused_pages: Vec<PageGlyphMap> = Vec::new();
-            for page in glyph_offsets_pages {
-                let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
-                for run in page.spans {
-                    let Some(start) = span_start.get(&run.span) else {
-                        // Unresolvable/generated span, skip to keep parity with glyphPositions filter.
-                        continue;
-                    };
-                    let span_hex = format!("{:x}", run.span);
-                    let abs_offsets: Vec<usize> =
-                        run.offsets.iter().map(|o| start + *o as usize).collect();
-                    merged.entry(span_hex).or_default().extend(abs_offsets);
-                }
-
-                if !merged.is_empty() {
-                    let spans: Vec<SpanGlyphMap> = merged
-                        .into_iter()
-                        .map(|(span_id, byte_offsets)| SpanGlyphMap { span_id, byte_offsets })
-                        .collect();
-                    fused_pages.push(PageGlyphMap {
-                        page: page.page,
-                        version: 1,
-                        spans,
-                    });
-                }
-            }
-
-            glyph_maps = fused_pages;
+            glyph_maps = fuse_glyph_maps_from_offsets(glyph_offsets_pages, &span_ranges);
         }
 
         // Filter glyph positions by page if filter is active
@@ -1430,17 +1449,46 @@ impl TypstCompileWorld {
             ));
         }
 
-        // Extract glyphMaps (byte offsets) using existing logic
-        let glyph_maps = self.collect_glyph_maps(doc, Some(&page_set));
+        // Extract glyphMaps + glyphPositions + layoutMap.
+        // In incr-glyph-maps builds, fuse glyphMaps from typst2vec glyph_offsets
+        // to guarantee parity by construction.
+        let (glyph_maps, layout_map, glyph_positions) = {
+            #[cfg(feature = "incr-glyph-maps")]
+            {
+                let span_ranges = match state.cached_span_ranges() {
+                    Some(ranges) => ranges.clone(),
+                    None => self.resolve_span_ranges(&[]),
+                };
 
-        // Extract glyphPositions (X/Y coordinates) using IncrServer's new method
-        let Some((layout_map, glyph_positions)) =
-            state.extract_glyph_positions_for_pages(&page_set)
-        else {
-            if cfg!(debug_assertions) {
-                console_log("[extract_glyph_data] Failed to extract glyph positions".to_string());
+                let Some((layout_map, glyph_positions, glyph_offsets)) =
+                    state.extract_glyph_positions_and_offsets_for_pages(&page_set)
+                else {
+                    if cfg!(debug_assertions) {
+                        console_log(
+                            "[extract_glyph_data] Failed to extract glyph positions/offsets"
+                                .to_string(),
+                        );
+                    }
+                    return Ok(JsValue::NULL);
+                };
+
+                let glyph_maps = fuse_glyph_maps_from_offsets(glyph_offsets, &span_ranges);
+                (glyph_maps, layout_map, glyph_positions)
             }
-            return Ok(JsValue::NULL);
+            #[cfg(not(feature = "incr-glyph-maps"))]
+            {
+                // Legacy path: glyphMaps via separate frame traversal.
+                let glyph_maps = self.collect_glyph_maps(doc, Some(&page_set));
+                let Some((layout_map, glyph_positions)) =
+                    state.extract_glyph_positions_for_pages(&page_set)
+                else {
+                    if cfg!(debug_assertions) {
+                        console_log("[extract_glyph_data] Failed to extract glyph positions".to_string());
+                    }
+                    return Ok(JsValue::NULL);
+                };
+                (glyph_maps, layout_map, glyph_positions)
+            }
         };
 
         // Filter glyphPositions to only include spans that have byte offsets in glyphMaps.

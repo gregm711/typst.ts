@@ -149,7 +149,9 @@ impl TypstPageElem {
                     );
 
                     let Some(should_ch) = ch else {
-                        web_sys::console::log_2(&"Invalid group reference".into(), &g);
+                        if cfg!(debug_assertions) {
+                            web_sys::console::log_2(&"Invalid group reference".into(), &g);
+                        }
                         // panic!("Invalid group reference: {}", fg.as_svg_id("g"));
                         continue;
                     };
@@ -160,10 +162,12 @@ impl TypstPageElem {
                         should_ch
                             .first_element_child()
                             .ok_or_else(|| {
-                                web_sys::console::log_2(
-                                    &should_ch,
-                                    &format!("Invalid group translate: {item:?}").into(),
-                                );
+                                if cfg!(debug_assertions) {
+                                    web_sys::console::log_2(
+                                        &should_ch,
+                                        &format!("Invalid group translate: {item:?}").into(),
+                                    );
+                                }
                                 panic!("Invalid group translate: {}", fg.as_svg_id("g"));
                             })
                             .unwrap()
@@ -181,10 +185,12 @@ impl TypstPageElem {
                 let ch = g
                     .last_element_child()
                     .ok_or_else(|| {
-                        web_sys::console::log_2(
-                            &g,
-                            &format!("Invalid item reference: {item:?}").into(),
-                        );
+                        if cfg!(debug_assertions) {
+                            web_sys::console::log_2(
+                                &g,
+                                &format!("Invalid item reference: {item:?}").into(),
+                            );
+                        }
                         panic!("Invalid item reference: {}", fg.as_svg_id("g"));
                     })
                     .unwrap();
@@ -206,10 +212,12 @@ impl TypstPageElem {
                     ctx,
                     ch.first_element_child()
                         .ok_or_else(|| {
-                            web_sys::console::log_2(
-                                &g,
-                                &format!("Invalid item translate: {item:?}").into(),
-                            );
+                            if cfg!(debug_assertions) {
+                                web_sys::console::log_2(
+                                    &g,
+                                    &format!("Invalid item translate: {item:?}").into(),
+                                );
+                            }
                             panic!("Invalid item translate: {}", fg.as_svg_id("g"));
                         })
                         .unwrap()
@@ -227,10 +235,12 @@ impl TypstPageElem {
                 let ch = g
                     .last_element_child()
                     .ok_or_else(|| {
-                        web_sys::console::log_2(
-                            &g,
-                            &format!("Invalid item reference: {item:?}").into(),
-                        );
+                        if cfg!(debug_assertions) {
+                            web_sys::console::log_2(
+                                &g,
+                                &format!("Invalid item reference: {item:?}").into(),
+                            );
+                        }
                         panic!("Invalid item reference: {}", fg.as_svg_id("g"));
                     })
                     .unwrap();
@@ -252,10 +262,12 @@ impl TypstPageElem {
                     ctx,
                     ch.first_element_child()
                         .ok_or_else(|| {
-                            web_sys::console::log_2(
-                                &g,
-                                &format!("Invalid item translate: {item:?}").into(),
-                            );
+                            if cfg!(debug_assertions) {
+                                web_sys::console::log_2(
+                                    &g,
+                                    &format!("Invalid item translate: {item:?}").into(),
+                                );
+                            }
                             panic!("Invalid item translate: {}", fg.as_svg_id("g"));
                         })
                         .unwrap()
