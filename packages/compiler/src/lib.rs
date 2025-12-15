@@ -16,6 +16,9 @@ mod test_glyph_maps;
 #[cfg(all(test, feature = "incr"))]
 mod test_span_comparison;
 
+#[cfg(all(test, feature = "incr", not(target_arch = "wasm32")))]
+mod test_span_ranges_output;
+
 #[cfg(all(test, feature = "incr", feature = "incr-glyph-maps"))]
 mod test_hydration_parity;
 
@@ -207,6 +210,166 @@ fn fuse_glyph_maps_from_offsets(
     }
 
     fused_pages
+}
+
+/// Resolve spanRanges + sourceFiles for the given raw span IDs.
+///
+/// - Resolves each span independently via `span.id()` and that file's `Source::range(span)`.
+/// - Uses rooted virtual paths (`/foo/bar.typ`) for `sourceFiles` paths.
+/// - Skips detached/unresolvable spans so `glyphMaps` can maintain the invariant:
+///   every emitted glyph span has a spanRange entry.
+#[cfg(feature = "incr")]
+fn resolve_span_ranges_and_source_files_for_span_ids(
+    world: &dyn ::typst::World,
+    span_ids: &HashSet<u64>,
+) -> (Vec<(String, u32, usize, usize)>, Vec<(u32, String)>) {
+    use ::typst::syntax::{FileId, Source, Span};
+    use std::collections::{HashMap, HashSet as StdHashSet};
+    use std::num::NonZeroU64;
+
+    let mut sorted: Vec<u64> = span_ids.iter().copied().collect();
+    sorted.sort_unstable();
+
+    let mut source_cache: HashMap<FileId, Source> = HashMap::new();
+    let mut file_ids: StdHashSet<FileId> = StdHashSet::new();
+    let mut span_ranges: Vec<(String, u32, usize, usize)> = Vec::new();
+
+    for raw in sorted {
+        let Some(raw_nz) = NonZeroU64::new(raw) else {
+            continue;
+        };
+
+        let span = Span::from_raw(raw_nz);
+        if span.is_detached() {
+            continue;
+        }
+
+        let Some(file_id) = span.id() else {
+            continue;
+        };
+
+        let source = if let Some(existing) = source_cache.get(&file_id) {
+            existing.clone()
+        } else {
+            let Ok(source) = world.source(file_id) else {
+                continue;
+            };
+            source_cache.insert(file_id, source.clone());
+            source
+        };
+
+        // Prefer raw range spans, fall back to resolving numbered spans within the source.
+        let Some(range) = span.range().or_else(|| source.range(span)) else {
+            continue;
+        };
+
+        file_ids.insert(file_id);
+        span_ranges.push((
+            format!("{:x}", raw),
+            file_id.into_raw().get() as u32,
+            range.start,
+            range.end,
+        ));
+    }
+
+    let mut source_files: Vec<(u32, String)> = file_ids
+        .into_iter()
+        .map(|file_id| {
+            let mut path = file_id.vpath().as_rooted_path().display().to_string();
+            // Normalize to POSIX-style paths for JS regardless of host separators.
+            if path.contains('\\') {
+                path = path.replace('\\', "/");
+            }
+            if !path.starts_with('/') {
+                path = format!("/{}", path);
+            }
+            (file_id.into_raw().get() as u32, path)
+        })
+        .collect();
+    source_files.sort_by_key(|(file_id, _)| *file_id);
+
+    (span_ranges, source_files)
+}
+
+#[cfg(all(feature = "incr", feature = "incr-glyph-maps"))]
+fn build_glyph_data_from_offsets(
+    world: &dyn ::typst::World,
+    glyph_offsets_pages: Vec<reflexo_typst2vec::layout::PageGlyphOffsets>,
+    glyph_positions: Vec<reflexo_typst2vec::layout::PageGlyphPositions>,
+    layout_map: Vec<reflexo_typst2vec::layout::PageLayout>,
+) -> (
+    Vec<PageGlyphMap>,
+    Vec<reflexo_typst2vec::layout::PageGlyphPositions>,
+    Vec<reflexo_typst2vec::layout::PageLayout>,
+    Vec<(String, u32, usize, usize)>,
+    Vec<(u32, String)>,
+) {
+    // Collect the unique spans encountered in the requested pages.
+    let span_ids: HashSet<u64> = glyph_offsets_pages
+        .iter()
+        .flat_map(|page| page.spans.iter().map(|s| s.span))
+        .filter(|s| *s != 0)
+        .collect();
+
+    // Resolve spanRanges + sourceFiles for those spans.
+    let (span_ranges, source_files) =
+        resolve_span_ranges_and_source_files_for_span_ids(world, &span_ids);
+
+    // Fuse glyphMaps from local typst2vec offsets using authoritative spanRanges.
+    let glyph_maps = fuse_glyph_maps_from_offsets(glyph_offsets_pages, &span_ranges);
+
+    // Keep glyph positions/layout coherent with glyph maps: only emit spans that
+    // have byte offsets. This prevents orphan spans (e.g., generated content) from
+    // reaching the client.
+    let fused_span_ids: HashSet<u64> = glyph_maps
+        .iter()
+        .flat_map(|page| {
+            page.spans
+                .iter()
+                .filter_map(|s| u64::from_str_radix(&s.span_id, 16).ok())
+        })
+        .collect();
+
+    let filtered_glyph_positions = glyph_positions
+        .into_iter()
+        .map(|mut page| {
+            page.spans.retain(|s| fused_span_ids.contains(&s.span));
+            page
+        })
+        .collect::<Vec<_>>();
+
+    let filtered_layout_map = layout_map
+        .into_iter()
+        .map(|mut page| {
+            page.spans.retain(|s| fused_span_ids.contains(&s.span));
+            page
+        })
+        .collect::<Vec<_>>();
+
+    // Keep spanRanges and sourceFiles bounded to the spans we actually emitted.
+    let filtered_span_ranges = span_ranges
+        .into_iter()
+        .filter(|(span_hex, _file_id, _start, _end)| {
+            u64::from_str_radix(span_hex, 16)
+                .ok()
+                .map(|raw| fused_span_ids.contains(&raw))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    let file_ids_used: HashSet<u32> = filtered_span_ranges.iter().map(|(_, f, _, _)| *f).collect();
+    let filtered_source_files = source_files
+        .into_iter()
+        .filter(|(file_id, _)| file_ids_used.contains(file_id))
+        .collect::<Vec<_>>();
+
+    (
+        glyph_maps,
+        filtered_glyph_positions,
+        filtered_layout_map,
+        filtered_span_ranges,
+        filtered_source_files,
+    )
 }
 
 /// Internal helper for geometric line verification.
@@ -1081,35 +1244,31 @@ impl TypstCompileWorld {
             return self.get_diag::<TypstPagedDocument>(diagnostics_format);
         };
 
-        // Collect glyph maps for accurate click-to-cursor positioning.
-        // In `incr-glyph-maps` builds we will fuse these from typst2vec output
-        // after the delta is produced; otherwise fall back to legacy traversal.
-        let mut glyph_maps = {
-            #[cfg(not(feature = "incr-glyph-maps"))]
-            {
-                // Filter to only requested pages if page_filter is set
-                self.collect_glyph_maps(&doc, page_filter.as_ref())
-            }
-            #[cfg(feature = "incr-glyph-maps")]
-            {
-                Vec::new()
-            }
-        };
+        // Collect legacy glyph maps for accurate click positioning when we
+        // cannot fuse them from typst2vec offsets.
+        #[cfg(not(feature = "incr-glyph-maps"))]
+        let glyph_maps = self.collect_glyph_maps(&doc, page_filter.as_ref());
 
         // Get total page count BEFORE moving doc into state.update()
         let total_page_count = doc.pages.len() as u32;
 
         let mut delta = state.update(doc);
-        let v = Uint8Array::from(delta.bytes.as_slice()).into();
+        let v: JsValue = Uint8Array::from(delta.bytes.as_slice()).into();
 
-        // Resolve span ranges from the world for source mapping.
-        // Cache once per successful incr_compile for hydration to reuse.
-        let span_ranges = self.resolve_span_ranges(&delta.bytes);
-        #[cfg(feature = "incr-glyph-maps")]
-        state.set_cached_span_ranges(span_ranges.clone());
-        let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
+        if diagnostics_format == 0 {
+            if cfg!(debug_assertions) {
+                console_log(
+                    "[incr_compile] diagnostics_format is 0, returning raw delta (no glyphMaps)"
+                        .to_string(),
+                );
+            }
+            return Ok(v);
+        }
 
-        // Fuse glyph maps from typst2vec local offsets to avoid a second frame traversal.
+        // Collect syntax nodes for editor protection (headings, lists, math, etc.)
+        let syntax_nodes = self.collect_syntax_nodes();
+        let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
+
         #[cfg(feature = "incr-glyph-maps")]
         {
             // Filter pages if requested.
@@ -1125,255 +1284,138 @@ impl TypstCompileWorld {
                 }
             };
 
-            glyph_maps = fuse_glyph_maps_from_offsets(glyph_offsets_pages, &span_ranges);
-        }
+            // Filter glyph positions by page if filter is active.
+            let glyph_positions = {
+                let glyph_map = std::mem::take(&mut delta.glyph_map);
+                if let Some(filter) = &page_filter {
+                    glyph_map
+                        .into_iter()
+                        .filter(|gp| filter.contains(&gp.page))
+                        .collect::<Vec<_>>()
+                } else {
+                    glyph_map
+                }
+            };
 
-        // Filter glyph positions by page if filter is active
-        let glyph_positions = {
-            let glyph_map = std::mem::take(&mut delta.glyph_map);
+            // Filter layout map by page if filter is active.
+            let layout_map = {
+                let layout_map = std::mem::take(&mut delta.layout_map);
+                if let Some(filter) = &page_filter {
+                    layout_map
+                        .into_iter()
+                        .filter(|lp| filter.contains(&lp.page))
+                        .collect::<Vec<_>>()
+                } else {
+                    layout_map
+                }
+            };
+
+            let world = &self.graph.snap.world;
+            let (glyph_maps, glyph_positions, layout_map, span_ranges, source_files) =
+                build_glyph_data_from_offsets(world, glyph_offsets_pages, glyph_positions, layout_map);
+
+            let span_ranges_js =
+                serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
+            let source_files_js =
+                serde_wasm_bindgen::to_value(&source_files).unwrap_or(JsValue::NULL);
+
+            let glyph_maps_js = serde_wasm_bindgen::to_value(&glyph_maps).unwrap_or(JsValue::NULL);
+            let glyph_positions_js =
+                serde_wasm_bindgen::to_value(&glyph_positions).unwrap_or(JsValue::NULL);
+            let layout_map_js =
+                serde_wasm_bindgen::to_value(&layout_map).unwrap_or(JsValue::NULL);
+
+            let result = js_sys::Object::new();
+            js_sys::Reflect::set(&result, &"result".into(), &v)?;
+            js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
+            js_sys::Reflect::set(&result, &"sourceFiles".into(), &source_files_js)?;
+            js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
+            js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
+            js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
+            js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
+            // Always include total page count so main thread knows document size.
+            js_sys::Reflect::set(
+                &result,
+                &"totalPageCount".into(),
+                &JsValue::from(total_page_count),
+            )?;
+            // Include filtered pages array if filter was active.
             if let Some(filter) = &page_filter {
-                glyph_map
-                    .into_iter()
-                    .filter(|gp| filter.contains(&gp.page))
-                    .collect::<Vec<_>>()
-            } else {
-                glyph_map
+                let filtered_pages: Vec<u32> = filter.iter().copied().collect();
+                let filtered_pages_js =
+                    serde_wasm_bindgen::to_value(&filtered_pages).unwrap_or(JsValue::NULL);
+                js_sys::Reflect::set(&result, &"filteredPages".into(), &filtered_pages_js)?;
             }
-        };
 
-        // Keep glyph positions/layout coherent with glyph maps: only emit spans that
-        // have byte offsets. This prevents orphan spans (e.g., generated content) from
-        // reaching the client.
-        let span_ids: std::collections::HashSet<u64> = glyph_maps
-            .iter()
-            .flat_map(|page| {
-                page.spans.iter().filter_map(|s| u64::from_str_radix(&s.span_id, 16).ok())
-            })
-            .collect();
-
-        let pre_filter_span_count: usize = if cfg!(debug_assertions) {
-            glyph_positions.iter().map(|p| p.spans.len()).sum()
-        } else {
-            0
-        };
-
-        // DEBUG: Log span counts before filtering to identify what's being dropped
-        if cfg!(debug_assertions) {
-            let glyph_positions_span_ids: std::collections::HashSet<u64> = glyph_positions
-                .iter()
-                .flat_map(|page| page.spans.iter().map(|s| s.span))
-                .collect();
-
-            // Find spans that are in glyph_positions but NOT in glyph_maps (will be filtered out)
-            let dropped_spans: Vec<u64> = glyph_positions_span_ids
-                .iter()
-                .filter(|id| !span_ids.contains(id))
-                .copied()
-                .collect();
-
-            if !dropped_spans.is_empty() || page_filter.is_some() {
-                let sample: Vec<String> = dropped_spans
-                    .iter()
-                    .take(10)
-                    .map(|s| format!("{:x}", s))
-                    .collect();
-                console_log(format!(
-                    "[incr_compile] SPAN FILTER DEBUG: glyphMaps has {} unique spans, glyphPositions has {} unique spans, dropping {} spans: {:?}",
-                    span_ids.len(),
-                    glyph_positions_span_ids.len(),
-                    dropped_spans.len(),
-                    sample
-                ));
-            }
+            return Ok(result.into());
         }
 
-        // ==========================================================================
-        // CARMACK DEBUG ASSERTION: Per-page span parity check BEFORE filtering
-        // This catches divergence between collect_glyph_maps and typst2vec at the source.
-        // ==========================================================================
-        #[cfg(debug_assertions)]
+        #[cfg(not(feature = "incr-glyph-maps"))]
         {
-            use std::collections::HashSet;
-            let all_pages: HashSet<u32> = glyph_maps.iter().map(|p| p.page)
-                .chain(glyph_positions.iter().map(|p| p.page))
+            // Resolve span ranges from the world for source mapping.
+            // NOTE: This walks only the main file AST.
+            let span_ranges = self.resolve_span_ranges(&delta.bytes);
+            let span_ranges_js =
+                serde_wasm_bindgen::to_value(&span_ranges).unwrap_or(JsValue::NULL);
+
+            // Filter glyph positions by page if filter is active.
+            let glyph_positions = {
+                let glyph_map = std::mem::take(&mut delta.glyph_map);
+                if let Some(filter) = &page_filter {
+                    glyph_map
+                        .into_iter()
+                        .filter(|gp| filter.contains(&gp.page))
+                        .collect::<Vec<_>>()
+                } else {
+                    glyph_map
+                }
+            };
+
+            let span_ids: std::collections::HashSet<u64> = glyph_maps
+                .iter()
+                .flat_map(|page| {
+                    page.spans
+                        .iter()
+                        .filter_map(|s| u64::from_str_radix(&s.span_id, 16).ok())
+                })
                 .collect();
 
-            for page_num in all_pages {
-                let gm_page = glyph_maps.iter().find(|p| p.page == page_num);
-                let gp_page = glyph_positions.iter().find(|p| p.page == page_num);
+            let filtered_glyph_positions = glyph_positions
+                .into_iter()
+                .map(|mut page| {
+                    page.spans.retain(|s| span_ids.contains(&s.span));
+                    page
+                })
+                .collect::<Vec<_>>();
 
-                let gm_span_ids: HashSet<String> = gm_page
-                    .map(|p| p.spans.iter().map(|s| s.span_id.to_lowercase()).collect())
-                    .unwrap_or_default();
-                let gp_span_ids: HashSet<String> = gp_page
-                    .map(|p| p.spans.iter().map(|s| format!("{:x}", s.span).to_lowercase()).collect())
-                    .unwrap_or_default();
+            let glyph_maps_js =
+                serde_wasm_bindgen::to_value(&glyph_maps).unwrap_or(JsValue::NULL);
+            let glyph_positions_js = serde_wasm_bindgen::to_value(&filtered_glyph_positions)
+                .unwrap_or(JsValue::NULL);
 
-                let in_gm_not_gp: Vec<_> = gm_span_ids.difference(&gp_span_ids).cloned().collect();
-                let in_gp_not_gm: Vec<_> = gp_span_ids.difference(&gm_span_ids).cloned().collect();
-
-                if !in_gm_not_gp.is_empty() || !in_gp_not_gm.is_empty() {
-                    console_log(format!(
-                        "[SPAN_PARITY_VIOLATION] Page {}: glyphMaps has {} unique spans, glyphPositions has {} unique spans",
-                        page_num, gm_span_ids.len(), gp_span_ids.len()
-                    ));
-                    if !in_gm_not_gp.is_empty() {
-                        console_log(format!(
-                            "[SPAN_PARITY_VIOLATION] Page {}: IN glyphMaps BUT NOT glyphPositions ({} spans): {:?}",
-                            page_num, in_gm_not_gp.len(), in_gm_not_gp.iter().take(10).collect::<Vec<_>>()
-                        ));
-                    }
-                    if !in_gp_not_gm.is_empty() {
-                        console_log(format!(
-                            "[SPAN_PARITY_VIOLATION] Page {}: IN glyphPositions BUT NOT glyphMaps ({} spans): {:?}",
-                            page_num, in_gp_not_gm.len(), in_gp_not_gm.iter().take(10).collect::<Vec<_>>()
-                        ));
-                    }
-                    // In debug builds, panic to surface the issue immediately
-                    // Comment out the panic for now to gather data, uncomment once fix is ready
-                    // panic!(
-                    //     "SPAN_PARITY_VIOLATION: Page {} has {} spans in glyphMaps not in glyphPositions, {} spans in glyphPositions not in glyphMaps",
-                    //     page_num, in_gm_not_gp.len(), in_gp_not_gm.len()
-                    // );
+            let layout_map = {
+                let layout_map = std::mem::take(&mut delta.layout_map);
+                if let Some(filter) = &page_filter {
+                    layout_map
+                        .into_iter()
+                        .filter(|lp| filter.contains(&lp.page))
+                        .collect::<Vec<_>>()
+                } else {
+                    layout_map
                 }
-            }
-        }
+            };
 
-        let filtered_glyph_positions = glyph_positions
-            .into_iter()
-            .map(|mut page| {
-                let before = page.spans.len();
-                page.spans.retain(|s| span_ids.contains(&s.span));
-                let after = page.spans.len();
-                if cfg!(debug_assertions) && before != after {
-                    console_log(format!(
-                        "[incr_compile] Page {} filtered: {} -> {} spans ({} dropped)",
-                        page.page, before, after, before - after
-                    ));
-                }
-                page
-            })
-            .collect::<Vec<_>>();
+            let filtered_layout_map = layout_map
+                .into_iter()
+                .map(|mut page| {
+                    page.spans.retain(|s| span_ids.contains(&s.span));
+                    page
+                })
+                .collect::<Vec<_>>();
 
-        let post_filter_span_count: usize = filtered_glyph_positions.iter().map(|p| p.spans.len()).sum();
-        if cfg!(debug_assertions) && pre_filter_span_count != post_filter_span_count {
-            console_log(format!(
-                "[incr_compile] TOTAL SPANS FILTERED: {} -> {} ({} dropped)",
-                pre_filter_span_count, post_filter_span_count, pre_filter_span_count - post_filter_span_count
-            ));
-        }
+            let layout_map_js =
+                serde_wasm_bindgen::to_value(&filtered_layout_map).unwrap_or(JsValue::NULL);
 
-        // Serialize glyph maps for accurate click positioning
-        let glyph_maps_js = match serde_wasm_bindgen::to_value(&glyph_maps) {
-            Ok(v) => {
-                if cfg!(debug_assertions) {
-                    console_log(format!(
-                        "[incr_compile] Serialized glyph maps: {} pages, is_null={}",
-                        glyph_maps.len(),
-                        v.is_null()
-                    ));
-                }
-                v
-            }
-            Err(e) => {
-                if cfg!(debug_assertions) {
-                    console_log(format!("[incr_compile] ERROR serializing glyph maps: {:?}", e));
-                }
-                JsValue::NULL
-            }
-        };
-
-        // Serialize glyph positions from typst2vec lowering (page-space x positions).
-        let glyph_positions_js =
-            serde_wasm_bindgen::to_value(&filtered_glyph_positions).unwrap_or(JsValue::NULL);
-
-        // Collect syntax nodes for editor protection (headings, lists, math, etc.)
-        let syntax_nodes = self.collect_syntax_nodes();
-        let syntax_nodes_js = serde_wasm_bindgen::to_value(&syntax_nodes).unwrap_or(JsValue::NULL);
-
-        // Filter layout map by page if filter is active
-        let layout_map = {
-            let layout_map = std::mem::take(&mut delta.layout_map);
-            if let Some(filter) = &page_filter {
-                layout_map
-                    .into_iter()
-                    .filter(|lp| filter.contains(&lp.page))
-                    .collect::<Vec<_>>()
-            } else {
-                layout_map
-            }
-        };
-
-        // Apply the SAME span_ids filter to layoutMap that we apply to glyphPositions
-        // This ensures layoutMap and glyphPositions have matching spans, preventing
-        // orphan spans (e.g., generated content) that have no glyph data from reaching the client
-        let filtered_layout_map = layout_map
-            .into_iter()
-            .map(|mut page| {
-                page.spans.retain(|s| span_ids.contains(&s.span));
-                page
-            })
-            .collect::<Vec<_>>();
-
-        let layout_map_js =
-            serde_wasm_bindgen::to_value(&filtered_layout_map).unwrap_or(JsValue::NULL);
-
-        // Log filtering info (debug-only to avoid wasm console overhead on hot path)
-        if cfg!(debug_assertions) {
-            if let Some(filter) = &page_filter {
-                console_log(format!(
-                    "[incr_compile] Page filter active: {} pages requested, {} total pages. Returning {} glyph_positions, {} layout_map entries",
-                    filter.len(),
-                    total_page_count,
-                    filtered_glyph_positions.len(),
-                    filtered_layout_map.len()
-                ));
-
-                // CARMACK: Diff span IDs between glyphMaps and glyphPositions BEFORE JS serialization
-                for page_num in filter.iter() {
-                    let gm_page = glyph_maps.iter().find(|p| p.page == *page_num);
-                    let gp_page = filtered_glyph_positions.iter().find(|p| p.page == *page_num);
-
-                    let gm_span_ids: HashSet<String> = gm_page
-                        .map(|p| p.spans.iter().map(|s| s.span_id.clone()).collect())
-                        .unwrap_or_default();
-                    let gp_span_ids: HashSet<String> = gp_page
-                        .map(|p| p.spans.iter().map(|s| format!("{:x}", s.span)).collect())
-                        .unwrap_or_default();
-
-                    let in_gm_not_gp: Vec<_> = gm_span_ids.difference(&gp_span_ids).collect();
-                    let in_gp_not_gm: Vec<_> = gp_span_ids.difference(&gm_span_ids).collect();
-
-                    if !in_gm_not_gp.is_empty() || !in_gp_not_gm.is_empty() {
-                        console_log(format!("[SPAN_MISMATCH_RUST] Page {}:", page_num));
-                        if !in_gm_not_gp.is_empty() {
-                            let sample: Vec<_> = in_gm_not_gp.iter().take(5).collect();
-                            console_log(format!(
-                                "  In glyphMaps but NOT glyphPositions ({}): {:?}",
-                                in_gm_not_gp.len(),
-                                sample
-                            ));
-                        }
-                        if !in_gp_not_gm.is_empty() {
-                            let sample: Vec<_> = in_gp_not_gm.iter().take(5).collect();
-                            console_log(format!(
-                                "  In glyphPositions but NOT glyphMaps ({}): {:?}",
-                                in_gp_not_gm.len(),
-                                sample
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(if diagnostics_format != 0 {
-            if cfg!(debug_assertions) {
-                console_log(format!(
-                    "[incr_compile] Building result object with diagnostics_format={}",
-                    diagnostics_format
-                ));
-            }
             let result = js_sys::Object::new();
             js_sys::Reflect::set(&result, &"result".into(), &v)?;
             js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
@@ -1381,31 +1423,20 @@ impl TypstCompileWorld {
             js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
             js_sys::Reflect::set(&result, &"syntaxNodes".into(), &syntax_nodes_js)?;
             js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
-            // Always include total page count so main thread knows document size
-            js_sys::Reflect::set(&result, &"totalPageCount".into(), &JsValue::from(total_page_count))?;
-            // Include filtered pages array if filter was active
+            js_sys::Reflect::set(
+                &result,
+                &"totalPageCount".into(),
+                &JsValue::from(total_page_count),
+            )?;
             if let Some(filter) = &page_filter {
                 let filtered_pages: Vec<u32> = filter.iter().copied().collect();
-                let filtered_pages_js = serde_wasm_bindgen::to_value(&filtered_pages).unwrap_or(JsValue::NULL);
+                let filtered_pages_js =
+                    serde_wasm_bindgen::to_value(&filtered_pages).unwrap_or(JsValue::NULL);
                 js_sys::Reflect::set(&result, &"filteredPages".into(), &filtered_pages_js)?;
             }
-            if cfg!(debug_assertions) {
-                console_log(format!(
-                    "[incr_compile] Result object created, glyphMaps set (value is_null={})",
-                    glyph_maps_js.is_null()
-                ));
-            }
-            result.into()
-        } else {
-            if cfg!(debug_assertions) {
-                console_log(
-                    "[incr_compile] diagnostics_format is 0, returning raw delta (no glyphMaps)"
-                        .to_string(),
-                );
-            }
-            // For backwards compatibility, just return delta if no diag format
-            v
-        })
+
+            Ok(result.into())
+        }
     }
 
     /// Extract glyph data (maps + positions) for specific pages from the cached document.
@@ -1449,97 +1480,142 @@ impl TypstCompileWorld {
             ));
         }
 
-        // Extract glyphMaps + glyphPositions + layoutMap.
-        // In incr-glyph-maps builds, fuse glyphMaps from typst2vec glyph_offsets
-        // to guarantee parity by construction.
-        let (glyph_maps, layout_map, glyph_positions) = {
-            #[cfg(feature = "incr-glyph-maps")]
-            {
-                let span_ranges = match state.cached_span_ranges() {
-                    Some(ranges) => ranges.clone(),
-                    None => self.resolve_span_ranges(&[]),
-                };
-
-                let Some((layout_map, glyph_positions, glyph_offsets)) =
-                    state.extract_glyph_positions_and_offsets_for_pages(&page_set)
-                else {
-                    if cfg!(debug_assertions) {
-                        console_log(
-                            "[extract_glyph_data] Failed to extract glyph positions/offsets"
-                                .to_string(),
-                        );
-                    }
-                    return Ok(JsValue::NULL);
-                };
-
-                let glyph_maps = fuse_glyph_maps_from_offsets(glyph_offsets, &span_ranges);
-                (glyph_maps, layout_map, glyph_positions)
-            }
-            #[cfg(not(feature = "incr-glyph-maps"))]
-            {
-                // Legacy path: glyphMaps via separate frame traversal.
-                let glyph_maps = self.collect_glyph_maps(doc, Some(&page_set));
-                let Some((layout_map, glyph_positions)) =
-                    state.extract_glyph_positions_for_pages(&page_set)
-                else {
-                    if cfg!(debug_assertions) {
-                        console_log("[extract_glyph_data] Failed to extract glyph positions".to_string());
-                    }
-                    return Ok(JsValue::NULL);
-                };
-                (glyph_maps, layout_map, glyph_positions)
-            }
-        };
-
-        // Filter glyphPositions to only include spans that have byte offsets in glyphMaps.
-        // This ensures parity and prevents orphan spans (generated content without source mapping).
-        let span_ids: std::collections::HashSet<u64> = glyph_maps
-            .iter()
-            .flat_map(|page| {
-                page.spans.iter().filter_map(|s| u64::from_str_radix(&s.span_id, 16).ok())
-            })
-            .collect();
-
-        let filtered_glyph_positions: Vec<_> = glyph_positions
-            .into_iter()
-            .map(|mut page| {
-                page.spans.retain(|s| span_ids.contains(&s.span));
-                page
-            })
-            .collect();
-
-        // Similarly filter layoutMap to keep coherence
-        let filtered_layout_map: Vec<_> = layout_map
-            .into_iter()
-            .map(|mut page| {
-                page.spans.retain(|s| span_ids.contains(&s.span));
-                page
-            })
-            .collect();
-
-        if cfg!(debug_assertions) {
-            console_log(format!(
-                "[extract_glyph_data] Extracted {} glyphMaps pages, {} glyphPositions pages (filtered), {} layoutMap pages (filtered)",
-                glyph_maps.len(), filtered_glyph_positions.len(), filtered_layout_map.len()
-            ));
-        }
+        let world = &self.graph.snap.world;
 
         // Serialize to JS
         let result = js_sys::Object::new();
 
-        let glyph_maps_js = serde_wasm_bindgen::to_value(&glyph_maps)
-            .map_err(|e| JsValue::from_str(&format!("Failed to serialize glyphMaps: {}", e)))?;
-        js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
+        // Extract glyphMaps + glyphPositions + layoutMap (+ spanRanges/sourceFiles).
+        // In incr-glyph-maps builds, fuse glyphMaps from typst2vec glyph_offsets
+        // to guarantee parity by construction.
+        #[cfg(feature = "incr-glyph-maps")]
+        {
+            let Some((layout_map, glyph_positions, glyph_offsets)) =
+                state.extract_glyph_positions_and_offsets_for_pages(&page_set)
+            else {
+                if cfg!(debug_assertions) {
+                    console_log(
+                        "[extract_glyph_data] Failed to extract glyph positions/offsets".to_string(),
+                    );
+                }
+                return Ok(JsValue::NULL);
+            };
 
-        let glyph_positions_js = serde_wasm_bindgen::to_value(&filtered_glyph_positions)
-            .map_err(|e| JsValue::from_str(&format!("Failed to serialize glyphPositions: {}", e)))?;
-        js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
+            let (glyph_maps, glyph_positions, layout_map, span_ranges, source_files) =
+                build_glyph_data_from_offsets(world, glyph_offsets, glyph_positions, layout_map);
 
-        let layout_map_js = serde_wasm_bindgen::to_value(&filtered_layout_map)
-            .map_err(|e| JsValue::from_str(&format!("Failed to serialize layoutMap: {}", e)))?;
-        js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
+            if cfg!(debug_assertions) {
+                console_log(format!(
+                    "[extract_glyph_data] Extracted {} glyphMaps pages, {} glyphPositions pages (filtered), {} layoutMap pages (filtered), {} spanRanges",
+                    glyph_maps.len(),
+                    glyph_positions.len(),
+                    layout_map.len(),
+                    span_ranges.len()
+                ));
+            }
 
-        Ok(result.into())
+            let glyph_maps_js = serde_wasm_bindgen::to_value(&glyph_maps)
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize glyphMaps: {}", e)))?;
+            js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
+
+            let glyph_positions_js = serde_wasm_bindgen::to_value(&glyph_positions).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize glyphPositions: {}", e))
+            })?;
+            js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
+
+            let layout_map_js = serde_wasm_bindgen::to_value(&layout_map)
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize layoutMap: {}", e)))?;
+            js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
+
+            let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges)
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize spanRanges: {}", e)))?;
+            js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
+
+            let source_files_js = serde_wasm_bindgen::to_value(&source_files).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize sourceFiles: {}", e))
+            })?;
+            js_sys::Reflect::set(&result, &"sourceFiles".into(), &source_files_js)?;
+
+            return Ok(result.into());
+        }
+
+        #[cfg(not(feature = "incr-glyph-maps"))]
+        {
+            // Legacy path: glyphMaps via separate frame traversal.
+            let glyph_maps = self.collect_glyph_maps(doc, Some(&page_set));
+            let Some((layout_map, glyph_positions)) =
+                state.extract_glyph_positions_for_pages(&page_set)
+            else {
+                if cfg!(debug_assertions) {
+                    console_log("[extract_glyph_data] Failed to extract glyph positions".to_string());
+                }
+                return Ok(JsValue::NULL);
+            };
+
+            // Filter glyphPositions/layoutMap to only include spans that have byte offsets in glyphMaps.
+            let span_ids: std::collections::HashSet<u64> = glyph_maps
+                .iter()
+                .flat_map(|page| {
+                    page.spans
+                        .iter()
+                        .filter_map(|s| u64::from_str_radix(&s.span_id, 16).ok())
+                })
+                .collect();
+
+            let filtered_glyph_positions: Vec<_> = glyph_positions
+                .into_iter()
+                .map(|mut page| {
+                    page.spans.retain(|s| span_ids.contains(&s.span));
+                    page
+                })
+                .collect();
+
+            let filtered_layout_map: Vec<_> = layout_map
+                .into_iter()
+                .map(|mut page| {
+                    page.spans.retain(|s| span_ids.contains(&s.span));
+                    page
+                })
+                .collect();
+
+            // Resolve spanRanges + sourceFiles for these spans (file-local byte offsets).
+            let (span_ranges, source_files) =
+                resolve_span_ranges_and_source_files_for_span_ids(world, &span_ids);
+
+            if cfg!(debug_assertions) {
+                console_log(format!(
+                    "[extract_glyph_data] Extracted {} glyphMaps pages, {} glyphPositions pages (filtered), {} layoutMap pages (filtered), {} spanRanges",
+                    glyph_maps.len(),
+                    filtered_glyph_positions.len(),
+                    filtered_layout_map.len(),
+                    span_ranges.len()
+                ));
+            }
+
+            let glyph_maps_js = serde_wasm_bindgen::to_value(&glyph_maps)
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize glyphMaps: {}", e)))?;
+            js_sys::Reflect::set(&result, &"glyphMaps".into(), &glyph_maps_js)?;
+
+            let glyph_positions_js = serde_wasm_bindgen::to_value(&filtered_glyph_positions).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize glyphPositions: {}", e))
+            })?;
+            js_sys::Reflect::set(&result, &"glyphPositions".into(), &glyph_positions_js)?;
+
+            let layout_map_js = serde_wasm_bindgen::to_value(&filtered_layout_map)
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize layoutMap: {}", e)))?;
+            js_sys::Reflect::set(&result, &"layoutMap".into(), &layout_map_js)?;
+
+            let span_ranges_js = serde_wasm_bindgen::to_value(&span_ranges)
+                .map_err(|e| JsValue::from_str(&format!("Failed to serialize spanRanges: {}", e)))?;
+            js_sys::Reflect::set(&result, &"spanRanges".into(), &span_ranges_js)?;
+
+            let source_files_js = serde_wasm_bindgen::to_value(&source_files).map_err(|e| {
+                JsValue::from_str(&format!("Failed to serialize sourceFiles: {}", e))
+            })?;
+            js_sys::Reflect::set(&result, &"sourceFiles".into(), &source_files_js)?;
+
+            Ok(result.into())
+        }
     }
 
     /// Resolve span IDs from delta to byte ranges using the world.

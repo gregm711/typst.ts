@@ -1723,8 +1723,12 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
     /// Note: See [`Self::increment_lifetime`], the `self.lifetime` increases by
     /// 2 each time.
     fn increase_lifetime_for_item(&self, pos: &AtomicU64) {
+        if !ENABLE_REF_CNT {
+            return;
+        }
         let c = pos.load(std::sync::atomic::Ordering::Relaxed);
-        if ENABLE_REF_CNT && c < self.lifetime - 1 {
+        let retained_lifetime = self.lifetime.saturating_sub(1);
+        if c < retained_lifetime {
             // Note that the Vec2Item is locked by mutable reference. And during update,
             // lifetime will be updated to either self.lifetime or self.lifetime
             // - 1. This indicates that it is fine to ignore the result of compare_exchange.
@@ -1735,7 +1739,7 @@ impl<const ENABLE_REF_CNT: bool> Typst2VecPassImpl<ENABLE_REF_CNT> {
             // Both cases are fine, as we renew the lifetime of the item.
             let _ = pos.compare_exchange(
                 c,
-                self.lifetime - 1,
+                retained_lifetime,
                 std::sync::atomic::Ordering::SeqCst,
                 std::sync::atomic::Ordering::SeqCst,
             );
