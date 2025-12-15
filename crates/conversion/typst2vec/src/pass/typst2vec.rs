@@ -2447,3 +2447,19 @@ static LINE_HINT_ELEMENTS: std::sync::LazyLock<std::collections::HashSet<&'stati
         set.insert("heading");
         set
     });
+
+#[cfg(test)]
+mod incr_lifetime_tests {
+    use super::*;
+
+    #[test]
+    fn store_cached_does_not_underflow_on_fresh_incr_pass() {
+        let pass = IncrTypst2VecPass::default();
+        let cond = 123u64;
+
+        let first = pass.store_cached(&cond, || VecItem::None);
+        let second = pass.store_cached(&cond, || VecItem::None);
+
+        assert_eq!(first, second);
+    }
+}
