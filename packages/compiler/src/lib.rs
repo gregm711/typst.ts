@@ -171,42 +171,121 @@ fn fuse_glyph_maps_from_offsets(
 ) -> Vec<PageGlyphMap> {
     use std::collections::HashMap;
 
-    // Build span start lookup (hex -> u64).
-    let mut span_start: HashMap<u64, usize> = HashMap::new();
-    for (span_hex, _file_id, start, _end) in span_ranges {
+    // Build span range lookup (raw -> (start,end)).
+    let mut span_bounds: HashMap<u64, (usize, usize)> = HashMap::new();
+    for (span_hex, _file_id, start, end) in span_ranges {
         if let Ok(raw) = u64::from_str_radix(span_hex, 16) {
-            span_start.insert(raw, *start);
+            span_bounds.insert(raw, (*start, *end));
         }
     }
 
     let mut fused_pages: Vec<PageGlyphMap> = Vec::new();
     for page in glyph_offsets_pages {
-        let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
+        // Group runs by span so we can fix trailing offsets using the *next run* or span end.
+        // typst2vec emits `glyph.span.1` (local start offsets) and currently guesses the trailing
+        // end offset with `+1`, which is incorrect for multi-byte codepoints, ligatures, ZWJ, etc.
+        //
+        // We repair this here using authoritative `spanRanges`:
+        // - For run i, set its trailing offset to the first edge of run i+1 (in local bytes)
+        // - For the final run, set trailing offset to (span_end - span_start)
+        //
+        // Additionally, clamp any offsets that would move backwards across runs so the resulting
+        // concatenated stream is non-decreasing in run order (synthetic glyphs can use 0).
+        let mut runs_by_span: HashMap<u64, Vec<(u32, Vec<u16>)>> = HashMap::new();
         for run in page.spans {
-            let Some(start) = span_start.get(&run.span) else {
+            if !span_bounds.contains_key(&run.span) {
                 // Unresolvable/generated span, skip to keep parity with glyphPositions filter.
                 continue;
-            };
-            let span_hex = format!("{:x}", run.span);
-            let abs_offsets: Vec<usize> =
-                run.offsets.iter().map(|o| start + *o as usize).collect();
-            merged.entry(span_hex).or_default().extend(abs_offsets);
+            }
+            runs_by_span
+                .entry(run.span)
+                .or_default()
+                .push((run.run_index, run.offsets));
         }
 
-        if !merged.is_empty() {
-            let spans: Vec<SpanGlyphMap> = merged
-                .into_iter()
-                .map(|(span_id, byte_offsets)| SpanGlyphMap {
-                    span_id,
-                    byte_offsets,
-                })
-                .collect();
-            fused_pages.push(PageGlyphMap {
-                page: page.page,
-                version: 1,
-                spans,
+        let mut spans: Vec<SpanGlyphMap> = Vec::new();
+        for (span_raw, mut runs) in runs_by_span {
+            let Some((span_start_abs, span_end_abs)) = span_bounds.get(&span_raw).copied() else {
+                continue;
+            };
+            let span_len_local = span_end_abs.saturating_sub(span_start_abs);
+
+            runs.sort_by_key(|(run_index, _)| *run_index);
+
+            // Precompute run end boundaries (local) so we can also clamp run starts.
+            let mut run_ends_local: Vec<usize> = Vec::with_capacity(runs.len());
+            for i in 0..runs.len() {
+                let offsets = &runs[i].1;
+                if offsets.is_empty() {
+                    run_ends_local.push(span_len_local);
+                    continue;
+                }
+
+                // Last "start" offset in this run (exclude the trailing end slot).
+                let last_start = if offsets.len() >= 2 {
+                    offsets[offsets.len() - 2] as usize
+                } else {
+                    offsets[0] as usize
+                };
+
+                let end_local = if i + 1 < runs.len() {
+                    let next = &runs[i + 1].1;
+                    let mut found: Option<usize> = None;
+                    // Search next run's non-trailing edges for the first offset >= last_start.
+                    // This skips synthetic 0-leading edges when they are not semantically part
+                    // of the contiguous text flow.
+                    for o in next.iter().take(next.len().saturating_sub(1)) {
+                        let v = *o as usize;
+                        if v >= last_start {
+                            found = Some(v);
+                            break;
+                        }
+                    }
+                    found.unwrap_or(span_len_local)
+                } else {
+                    span_len_local
+                };
+
+                run_ends_local.push(end_local.min(span_len_local));
+            }
+
+            let mut byte_offsets: Vec<usize> = Vec::new();
+            for i in 0..runs.len() {
+                let offsets = &runs[i].1;
+                if offsets.is_empty() {
+                    continue;
+                }
+
+                let run_start_local = if i == 0 { 0 } else { run_ends_local[i - 1] };
+                let run_end_local = run_ends_local[i];
+
+                // Non-trailing edges (glyph starts) clamped to run boundaries.
+                for o in offsets.iter().take(offsets.len().saturating_sub(1)) {
+                    let mut v = *o as usize;
+                    if v < run_start_local {
+                        v = run_start_local;
+                    }
+                    if v > run_end_local {
+                        v = run_end_local;
+                    }
+                    byte_offsets.push(span_start_abs + v);
+                }
+                // Trailing edge corrected to run end.
+                byte_offsets.push(span_start_abs + run_end_local);
+            }
+
+            spans.push(SpanGlyphMap {
+                span_id: format!("{:x}", span_raw),
+                byte_offsets,
             });
         }
+
+        spans.sort_by(|a, b| a.span_id.cmp(&b.span_id));
+        fused_pages.push(PageGlyphMap {
+            page: page.page,
+            version: 1,
+            spans,
+        });
     }
 
     fused_pages
@@ -1980,30 +2059,33 @@ impl TypstCompileWorld {
 
             Self::collect_glyphs_from_frame(&page.frame, &source, &mut spans);
 
-            if !spans.is_empty() {
-                // BUGFIX: Merge duplicate span entries into single entries per unique span_id.
-                // This matches typst2vec.rs behavior where each span has one entry per run,
-                // but we were creating multiple entries when spans appeared in multiple
-                // FrameItem::Text elements (e.g., heading marker + heading text).
-                //
-                // Group by span_id and concatenate byte_offsets for each occurrence.
-                use std::collections::HashMap;
-                let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
-                for span in spans {
-                    merged.entry(span.span_id)
-                        .or_default()
-                        .extend(span.byte_offsets);
-                }
-                let merged_spans: Vec<SpanGlyphMap> = merged.into_iter()
-                    .map(|(span_id, byte_offsets)| SpanGlyphMap { span_id, byte_offsets })
-                    .collect();
-
-                page_maps.push(PageGlyphMap {
-                    page: page_idx as u32,
-                    version: 1, // Increment on each compile if caching
-                    spans: merged_spans,
-                });
+            // Merge duplicate span entries into single entries per unique span_id.
+            // This matches typst2vec.rs behavior where each span has one entry per run,
+            // but we can create multiple entries when spans appear in multiple
+            // FrameItem::Text elements (e.g., heading marker + heading text).
+            //
+            // Group by span_id and concatenate byte_offsets for each occurrence.
+            use std::collections::HashMap;
+            let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
+            for span in spans {
+                merged.entry(span.span_id)
+                    .or_default()
+                    .extend(span.byte_offsets);
             }
+            let mut merged_spans: Vec<SpanGlyphMap> = merged
+                .into_iter()
+                .map(|(span_id, byte_offsets)| SpanGlyphMap { span_id, byte_offsets })
+                .collect();
+            merged_spans.sort_by(|a, b| a.span_id.cmp(&b.span_id));
+
+            // IMPORTANT: Always emit an entry for requested pages, even if they contain no spans.
+            // The hydration/viewport cache relies on page presence to validate contracts and
+            // clear pending hydration deterministically.
+            page_maps.push(PageGlyphMap {
+                page: page_idx as u32,
+                version: 1, // Increment on each compile if caching
+                spans: merged_spans,
+            });
         }
 
         // DEBUG LOGGING DISABLED - was blocking main thread via console overhead
@@ -2132,16 +2214,17 @@ impl TypstCompileWorld {
                     // Add end position to the last span
                     if let (Some(last_glyph), Some(last_id)) = (text.glyphs.last(), last_span_id) {
                         let last_span = last_glyph.span.0;
-                        let last_local_offset = last_glyph.span.1 as usize;
-
+                        // Prefer the authoritative span range end for the trailing edge.
+                        // `glyph.span.1` is a *start* offset within that span; adding `+1`
+                        // is incorrect for UTF-8 multi-byte codepoints and clusters.
                         let end_byte = if !last_span.is_detached() {
-                            if let Some(range) = source.range(last_span) {
-                                range.start + last_local_offset + 1
-                            } else {
-                                last_resolved_byte.map(|b| b + 1).unwrap_or(anchor_range.start + 1)
-                            }
+                            source
+                                .range(last_span)
+                                .map(|r| r.end)
+                                .unwrap_or_else(|| anchor_range.end)
                         } else {
-                            last_resolved_byte.map(|b| b + 1).unwrap_or(anchor_range.start + 1)
+                            // Detached glyphs have no source mapping; anchor to the attached range.
+                            anchor_range.end
                         };
 
                         per_span_offsets.entry(last_id).or_default().push(end_byte);

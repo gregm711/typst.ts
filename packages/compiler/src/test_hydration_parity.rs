@@ -16,11 +16,12 @@ mod tests {
     };
 
     #[test]
-    fn test_fuse_skips_unresolvable_spans_and_merges_runs() {
-        let span_ranges = vec![
-            ("1000".to_string(), 0, 100usize, 110usize),
-            ("2000".to_string(), 0, 200usize, 210usize),
-        ];
+    fn test_fuse_skips_unresolvable_spans_and_repairs_trailing_edges() {
+        // Span 0x1000 covers bytes [100, 104), so local span length is 4 bytes.
+        // typst2vec offsets are local to the span; the last offset in each run is
+        // historically a guessed "end" (often `last_start + 1`) and must be repaired
+        // using the *next run* boundary or the span end.
+        let span_ranges = vec![("1000".to_string(), 0, 100usize, 104usize)];
 
         let glyph_offsets_pages = vec![PageGlyphOffsets {
             page: 0,
@@ -28,12 +29,12 @@ mod tests {
                 SpanGlyphOffsets {
                     span: 0x1000,
                     run_index: 0,
-                    offsets: vec![0, 1, 2],
+                    offsets: vec![0, 1, 999],
                 },
                 SpanGlyphOffsets {
                     span: 0x1000,
                     run_index: 1,
-                    offsets: vec![3, 4],
+                    offsets: vec![2, 3, 999],
                 },
                 // Not in span_ranges -> should be skipped.
                 SpanGlyphOffsets {
@@ -53,12 +54,47 @@ mod tests {
             .iter()
             .find(|s| s.span_id == "1000")
             .expect("expected fused span 1000");
-        assert_eq!(span_1000.byte_offsets, vec![100, 101, 102, 103, 104]);
+        // Repaired edges:
+        // - Run 0 trailing edge becomes the first edge of run 1 (local 2 -> abs 102)
+        // - Final run trailing edge becomes span end (local 4 -> abs 104)
+        assert_eq!(span_1000.byte_offsets, vec![100, 101, 102, 102, 103, 104]);
 
         assert!(
             fused[0].spans.iter().all(|s| s.span_id != "9999"),
             "unresolvable spans must be skipped"
         );
+    }
+
+    #[test]
+    fn test_fuse_emits_empty_page_entries_for_requested_pages() {
+        let span_ranges = vec![("1000".to_string(), 0, 0usize, 4usize)];
+
+        let glyph_offsets_pages = vec![
+            PageGlyphOffsets {
+                page: 0,
+                spans: vec![SpanGlyphOffsets {
+                    span: 0x1000,
+                    run_index: 0,
+                    offsets: vec![0, 1, 2],
+                }],
+            },
+            // Page 1 contains only unresolvable spans; it must still be present
+            // in the output to satisfy the hydration contract.
+            PageGlyphOffsets {
+                page: 1,
+                spans: vec![SpanGlyphOffsets {
+                    span: 0x9999,
+                    run_index: 0,
+                    offsets: vec![0, 1, 2],
+                }],
+            },
+        ];
+
+        let fused = fuse_glyph_maps_from_offsets(glyph_offsets_pages, &span_ranges);
+        assert_eq!(fused.len(), 2);
+        assert_eq!(fused[0].page, 0);
+        assert_eq!(fused[1].page, 1);
+        assert!(fused[1].spans.is_empty(), "page 1 must be emitted even if empty");
     }
 
     #[test]
@@ -165,4 +201,3 @@ mod tests {
         assert_eq!(gm_spans, HashSet::from(["1000".to_string()]));
     }
 }
-
